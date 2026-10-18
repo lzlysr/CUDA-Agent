@@ -1,0 +1,23 @@
+# Source this file from bash.
+export CUDA_AGENT_ROOT=/home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+export CUDA_AGENT_GPU_UUID=GPU-ac246f3e-147f-4145-cac6-ab33881f4308
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=4
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH="$CUDA_HOME/bin:$PATH"
+export TMPDIR="$CUDA_AGENT_ROOT/.runtime/tmp"
+export PIP_CACHE_DIR="$CUDA_AGENT_ROOT/.runtime/cache/pip"
+export HF_HOME="$CUDA_AGENT_ROOT/.runtime/cache/huggingface"
+export TORCH_EXTENSIONS_DIR="$CUDA_AGENT_ROOT/.runtime/cache/torch_extensions"
+export TRITON_CACHE_DIR="$CUDA_AGENT_ROOT/.runtime/cache/triton"
+export XDG_CACHE_HOME="$CUDA_AGENT_ROOT/.runtime/cache/xdg"
+export CONDA_PKGS_DIRS="$CUDA_AGENT_ROOT/.runtime/cache/conda"
+export MAX_JOBS=4
+export TORCH_CUDA_ARCH_LIST=8.0
+export TOKENIZERS_PARALLELISM=false
+export TORCHINDUCTOR_CACHE_DIR="$CUDA_AGENT_ROOT/.runtime/cache/inductor"
+export VLLM_CACHE_ROOT="$CUDA_AGENT_ROOT/.runtime/cache/vllm"
+export OMP_NUM_THREADS=4
+export VLLM_NO_USAGE_STATS=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export WANDB_MODE=disabled
