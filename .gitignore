@@ -1,2 +1,4 @@
 /models/
 /.runtime/
+/runs/
+/.vscode/

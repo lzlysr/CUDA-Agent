@@ -1,0 +1,122 @@
+[
+  {
+    "ops": "[\"nn.ReLU\", \"torch.ne\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\n\n\nclass Model(nn.Module):\n    def __init__(self, inplace: bool = False):\n        super().__init__()\n        self.relu = nn.ReLU(inplace)\n\n    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:\n        x = self.relu(x)\n        return torch.ne(x, y)\n\n\nbatch_size = 512\nchannels = 128\nheight, width = 64, 64  # Increased from 20x20 to 64x64 to increase computation\n\n\ndef get_inputs():\n    x = torch.randn(batch_size, channels, height, width)\n    y = torch.randn(batch_size, channels, height, width)\n    return [x, y]\n\n\ndef get_init_inputs():\n    return [False]",
+    "row_index": 1422,
+    "source_hash": "0a3bd9a821e52102f4f76d97343ad00f9f634bcf2274d329c4b401cf649b3052",
+    "normalized_hash": "939f4a6e2eab9f4972a3d8e4d40d92588e05f481bdf288c13b410706c50c2a40",
+    "task_id": "ops6k-939f4a6e2eab9f49",
+    "split": "train"
+  },
+  {
+    "ops": "[\"nn.SiLU\", \"nn.MultiheadAttention\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\n\n\nclass Model(nn.Module):\n    def __init__(self, embedding_dim, num_heads, max_seq_length):\n        super().__init__()\n        self.silu = nn.SiLU()\n        self.multihead_attn = nn.MultiheadAttention(embedding_dim, num_heads, batch_first=True)\n        self.register_buffer(\n            \"attn_mask\", torch.triu(torch.ones(max_seq_length, max_seq_length) * float(\"-inf\"), diagonal=1)\n        )\n\n    def forward(self, x):\n        x = self.silu(x)\n        x, _ = self.multihead_attn(x, x, x, attn_mask=self.attn_mask)\n        return x\n\n\nbatch_size = 32\nembedding_dim = 128\nnum_heads = 4\nseq_length = 1024  # Increased from 512 to increase runtime\n\n\ndef get_inputs():\n    return [torch.randn(batch_size, seq_length, embedding_dim)]\n\n\ndef get_init_inputs():\n    return [embedding_dim, num_heads, seq_length]",
+    "row_index": 5388,
+    "source_hash": "893b53942ae4baa6af3eb1005bd9c100e774964e6b0d67f21b523e46f188f731",
+    "normalized_hash": "4b30bedf7b66681807fc2498e4427871855cba6b60872edfcbcda24adc9c5769",
+    "task_id": "ops6k-4b30bedf7b666818",
+    "split": "train"
+  },
+  {
+    "ops": "[\"F.softmax\", \"torch.median\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self, num_classes, input_dim):\n        super().__init__()\n        self.softmax = F.softmax\n        self.median = torch.median\n        self.num_classes = num_classes\n        self.input_dim = input_dim\n\n    def forward(self, x):\n        x = self.softmax(x, dim=self.input_dim)\n        x = self.median(x, dim=self.input_dim)\n        return x\n\n\ndef get_inputs():\n    return [torch.randn(256, 65536)]\n\n\ndef get_init_inputs():\n    return [2, 1]",
+    "row_index": 3042,
+    "source_hash": "3409a83175d12ba464cd91e03678ede4a8ca4db8e230ee98c57ca1b0032d0af9",
+    "normalized_hash": "f9da864ce17744c9207830f764372f52bfd6b2fc06aa28fce6d2fbbc1ed8fe0c",
+    "task_id": "ops6k-f9da864ce17744c9",
+    "split": "train"
+  },
+  {
+    "ops": "[\"F.hardsigmoid\", \"torch.relu\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, x, y):\n        x = F.hardsigmoid(x)\n        y = torch.relu(y)\n        return x, y\n\n\nbatch_size = 128\nfeatures = 64\ninput_width, input_height = 1024, 32  # Increased input_width to 1024\n\n\ndef get_inputs():\n    x = torch.randn(batch_size, features, input_height, input_width)\n    y = torch.randn(batch_size, features, input_height, input_width)\n    return [x, y]\n\n\ndef get_init_inputs():\n    return []",
+    "row_index": 140,
+    "source_hash": "50bbbdc29303fd1d28b20cee5f7a23911888d493bc24698a89704eb506499190",
+    "normalized_hash": "9fbe88dcf4053fa486a3c8dd7b5b420e201d9806b80bd54b8d448e70d86f7772",
+    "task_id": "ops6k-9fbe88dcf4053fa4",
+    "split": "train"
+  },
+  {
+    "ops": "[\"nn.BatchNorm2d\", \"torch.min\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\n\n\nclass Model(nn.Module):\n    def __init__(self, num_features, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True):\n        super().__init__()\n        self.batch_norm = nn.BatchNorm2d(num_features, eps, momentum, affine, track_running_stats)\n\n    def forward(self, x):\n        x = self.batch_norm(x)\n        x_min = torch.min(x)\n        return x_min\n\n\nbatch_size = 16\nnum_features = 64\nheight = 512  # Changed from 224 to 512 to ensure one dimension >=512\nwidth = 224\n\n\ndef get_inputs():\n    x = torch.randn(batch_size, num_features, height, width)\n    return [x]\n\n\ndef get_init_inputs():\n    return [num_features]\n",
+    "row_index": 5040,
+    "source_hash": "039c4336702644344b9b80ceb7e26a89c967744a86587a5c6a93143207b18d77",
+    "normalized_hash": "7872d67c6198c50ade9f2892146747dc0e60835d51a7f0d760f8cdadc8e4e2ed",
+    "task_id": "ops6k-7872d67c6198c50a",
+    "split": "train"
+  },
+  {
+    "ops": "[\"nn.ReflectionPad2d\", \"torch.log2\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\n\n\nclass Model(nn.Module):\n    def __init__(self, padding):\n        super().__init__()\n        self.reflection_pad = nn.ReflectionPad2d(padding)\n\n    def forward(self, x):\n        x = self.reflection_pad(x)\n        x = torch.log2(x)\n        return x\n\n\nbatch_size = 128\nchannels = 3\nheight, width = 1024, 256  # Increased spatial dimensions to increase runtime\npadding = 2\n\n\ndef get_inputs():\n    return [torch.rand(batch_size, channels, height, width) + 1e-5]  # Adding a small value to avoid log2(0)\n\n\ndef get_init_inputs():\n    return [padding]",
+    "row_index": 280,
+    "source_hash": "aa406f0abe3cc859bb2a7bc1fd12cd22df592c901e3a9e68882dd81685fc22c0",
+    "normalized_hash": "f3750b017c78d8f07fce7fa1a33cb659c629aa219870c5d9bbb9efbc2fcb8c59",
+    "task_id": "ops6k-f3750b017c78d8f0",
+    "split": "train"
+  },
+  {
+    "ops": "[\"nn.GroupNorm\", \"torch.log_softmax\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\n\n\nclass Model(nn.Module):\n    def __init__(self, num_channels, eps):\n        super().__init__()\n        self.group_norm = nn.GroupNorm(num_channels, num_channels)\n        self.eps = eps\n\n    def forward(self, x):\n        x = self.group_norm(x)\n        x = torch.log_softmax(x, dim=1)\n        return x\n\n\nnum_channels = 16\neps = 1e-5\nheight, width = 128, 128  # Increased spatial dimensions to increase computation\nbatch_size = 512\n\n\ndef get_inputs():\n    return [torch.randn(batch_size, num_channels, height, width)]\n\n\ndef get_init_inputs():\n    return [num_channels, eps]",
+    "row_index": 582,
+    "source_hash": "5f8323e1a1ab827062d620da384abc949549e1a2ade8e8e158672b2ed17c1270",
+    "normalized_hash": "51844277a90906e91afdbaff80b03d660d22663a83842348eaaeb8013cad0f5a",
+    "task_id": "ops6k-51844277a90906e9",
+    "split": "train"
+  },
+  {
+    "ops": "[\"torch.cumprod\", \"torch.max\", \"F.gelu\", \"nn.ConvTranspose2d\"]",
+    "data_source": "torch#4",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):\n        super().__init__()\n        self.conv_transpose = nn.ConvTranspose2d(\n            in_channels,\n            out_channels,\n            kernel_size,\n            stride=stride,\n            padding=padding,\n            output_padding=output_padding,\n            bias=True,\n        )\n        self.bias = nn.Parameter(torch.randn(bias_shape))\n\n    def forward(self, x):\n        x = self.conv_transpose(x) + self.bias\n        x = torch.clamp(x, min=0.0, max=1.0)\n        x = F.gelu(x)\n        x = torch.max(x, dim=1)\n        return x\n\n\nbatch_size = 512\nin_channels = 3\nout_channels = 16\nheight, width = 32, 32\nkernel_size = 3\nstride = 2\npadding = 1\noutput_padding = 1\nbias_shape = (out_channels, 1, 1)\n\n\ndef get_inputs():\n    return [torch.randn(batch_size, in_channels, height, width)]\n\n\ndef get_init_inputs():\n    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape]\n",
+    "row_index": 5073,
+    "source_hash": "a615e4b9feadd9be940e011a7f802294a9685c4938c906b4c0ce02d57acd877b",
+    "normalized_hash": "b56ae5cf145736448ecdc695a6672b9aedd29259f696ef0e46728dc6323fb663",
+    "task_id": "ops6k-b56ae5cf14573644",
+    "split": "train"
+  },
+  {
+    "ops": "BrosBboxEmbeddings_1",
+    "data_source": "transformers",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom typing import *\n\n\n\nclass BrosPositionalEmbedding1D(nn.Module):\n    # Reference: https://github.com/kimiyoung/transformer-xl/blob/master/pytorch/mem_transformer.py#L15\n\n    def __init__(self, config):\n        super(BrosPositionalEmbedding1D, self).__init__()\n\n        self.dim_bbox_sinusoid_emb_1d = config.dim_bbox_sinusoid_emb_1d\n\n        inv_freq = 1 / (\n            10000 ** (torch.arange(0.0, self.dim_bbox_sinusoid_emb_1d, 2.0) / self.dim_bbox_sinusoid_emb_1d)\n        )\n        self.register_buffer(\"inv_freq\", inv_freq)\n\n    def forward(self, pos_seq: torch.Tensor) -> torch.Tensor:\n        seq_size = pos_seq.size()\n        b1, b2, b3 = seq_size\n        sinusoid_inp = pos_seq.view(b1, b2, b3, 1) * self.inv_freq.view(1, 1, 1, self.dim_bbox_sinusoid_emb_1d // 2)\n        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)\n        return pos_emb\n\n\nclass BrosPositionalEmbedding2D(nn.Module):\n    def __init__(self, config):\n        super(BrosPositionalEmbedding2D, self).__init__()\n\n        self.dim_bbox = config.dim_bbox\n        self.x_pos_emb = BrosPositionalEmbedding1D(config)\n        self.y_pos_emb = BrosPositionalEmbedding1D(config)\n\n    def forward(self, bbox: torch.Tensor) -> torch.Tensor:\n        stack = []\n        for i in range(self.dim_bbox):\n            if i % 2 == 0:\n                stack.append(self.x_pos_emb(bbox[..., i]))\n            else:\n                stack.append(self.y_pos_emb(bbox[..., i]))\n        bbox_pos_emb = torch.cat(stack, dim=-1)\n        return bbox_pos_emb\n\n\nclass Model(nn.Module):\n    def __init__(self, config):\n        super(Model, self).__init__()\n        self.bbox_sinusoid_emb = BrosPositionalEmbedding2D(config)\n        self.bbox_projection = nn.Linear(config.dim_bbox_sinusoid_emb_2d, config.dim_bbox_projection, bias=False)\n\n    def forward(self, bbox: torch.Tensor):\n        bbox_t = bbox.transpose(0, 1)\n        bbox_pos = bbox_t[None, :, :, :] - bbox_t[:, None, :, :]\n        bbox_pos_emb = self.bbox_sinusoid_emb(bbox_pos)\n        bbox_pos_emb = self.bbox_projection(bbox_pos_emb)\n\n        return bbox_pos_emb\n\n\ndef get_inputs():\n    bbox = torch.randn(200, 100, 8, dtype=torch.float32)\n    return (bbox,)\n\ndef get_init_inputs():\n    import transformers\n    config = transformers.BrosConfig(return_dict=True,output_hidden_states=False,output_attentions=True,torchscript=False,torch_dtype=None,use_bfloat16=False,tf_legacy_loss=False,pruned_heads={  },tie_word_embeddings=True,chunk_size_feed_forward=0,is_encoder_decoder=False,is_decoder=False,cross_attention_hidden_size=None,add_cross_attention=False,tie_encoder_decoder=False,max_length=20,min_length=0,do_sample=False,early_stopping=False,num_beams=1,num_beam_groups=1,diversity_penalty=0.0,temperature=1.0,top_k=50,top_p=1.0,typical_p=1.0,repetition_penalty=1.0,length_penalty=1.0,no_repeat_ngram_size=0,encoder_no_repeat_ngram_size=0,bad_words_ids=None,num_return_sequences=1,output_scores=False,return_dict_in_generate=False,forced_bos_token_id=None,forced_eos_token_id=None,remove_invalid_values=False,exponential_decay_length_penalty=None,suppress_tokens=None,begin_suppress_tokens=None,architectures=None,finetuning_task=None,id2label={ 0:'LABEL_0', 1:'LABEL_1' },label2id={ 'LABEL_0':0, 'LABEL_1':1 },tokenizer_class=None,prefix=None,bos_token_id=None,pad_token_id=0,eos_token_id=None,sep_token_id=None,decoder_start_token_id=None,task_specific_params=None,problem_type=None,_name_or_path='',_attn_implementation_autoset=True,transformers_version='4.51.0.dev0',vocab_size=99,hidden_size=64,num_hidden_layers=5,num_attention_heads=4,intermediate_size=37,hidden_act='gelu',hidden_dropout_prob=0.1,attention_probs_dropout_prob=0.1,max_position_embeddings=512,type_vocab_size=16,initializer_range=0.02,layer_norm_eps=1e-12,dim_bbox=8,bbox_scale=100.0,n_relations=1,dim_bbox_sinusoid_emb_2d=256,dim_bbox_sinusoid_emb_1d=32,dim_bbox_projection=128,classifier_dropout_prob=0.1,model_type='bros',)\n    return (config,)",
+    "row_index": 5961,
+    "source_hash": "0ba3c7aeaea3e46a9615c2400f7a11b0f69f5af25039010812897fd092d2f711",
+    "normalized_hash": "d5903209a0ffe9470e34e1d2aab3546bbcbec9e67af9f9dbca32075603cf76cf",
+    "task_id": "ops6k-d5903209a0ffe947",
+    "split": "train"
+  },
+  {
+    "ops": "[\"F.interpolate\", \"torch.tanh\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self, scale_factor, mode, in_channels):\n        super().__init__()\n        self.scale_factor = scale_factor\n        self.mode = mode\n        self.in_channels = in_channels\n\n    def forward(self, x):\n        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)\n        x = torch.tanh(x)\n        return x\n\n\nbatch_size = 64\nin_channels = 3\nheight = 512\nwidth = 512  # Increased width to match height for larger input size\nscale_factor = 2.0\nmode = \"bilinear\"\n\n\ndef get_inputs():\n    return [torch.randn(batch_size, in_channels, height, width)]\n\n\ndef get_init_inputs():\n    return [scale_factor, mode, in_channels]",
+    "row_index": 3175,
+    "source_hash": "fa1c7faefb6be89344d90992d46599da21e676515a399b126b1b8ef741047227",
+    "normalized_hash": "030adfe946c4729a2868882185ca2bd141bb74a531efa2c967f4500ddd3efbae",
+    "task_id": "ops6k-030adfe946c4729a",
+    "split": "train"
+  },
+  {
+    "ops": "[\"F.scaled_dot_product_attention\", \"torch.lt\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self, embed_dim, num_heads, comparison_value):\n        super().__init__()\n        self.embed_dim = embed_dim\n        self.num_heads = num_heads\n        self.comparison_value = comparison_value\n\n    def forward(self, q, k, v, mask=None):\n        x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)\n        x = torch.lt(x, self.comparison_value)\n        return x\n\n\nbatch_size = 128\nnum_heads = 8\nembed_dim = 128\nseq_length = 512\ncomparison_value = 0.5\n\n\ndef get_inputs():\n    q = torch.randn(batch_size, num_heads, seq_length, embed_dim // num_heads)\n    k = torch.randn(batch_size, num_heads, seq_length, embed_dim // num_heads)\n    v = torch.randn(batch_size, num_heads, seq_length, embed_dim // num_heads)\n    mask = torch.rand(batch_size, num_heads, seq_length, seq_length) > 0.5\n    return [q, k, v, mask]\n\n\ndef get_init_inputs():\n    return [embed_dim, num_heads, comparison_value]\n",
+    "row_index": 5187,
+    "source_hash": "20576ca0c94999cfe2382ebf9bd8385de88c698e56ade00a7b514ea1fa70c7d2",
+    "normalized_hash": "4ac775908ca38f43078196194b56d9d81ab6a5cd59610ec7b2546ab4c4c1c3ce",
+    "task_id": "ops6k-4ac775908ca38f43",
+    "split": "train"
+  },
+  {
+    "ops": "[\"nn.Embedding\", \"F.log_softmax\"]",
+    "data_source": "torch#2",
+    "code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    def __init__(self, num_embeddings, embedding_dim):\n        super().__init__()\n        self.embedding = nn.Embedding(num_embeddings, embedding_dim)\n\n    def forward(self, x):\n        x = self.embedding(x)\n        x = F.log_softmax(x, dim=1)\n        return x\n\n\nnum_embeddings = 1000\nembedding_dim = 512\nseq_length = 1024\nbatch_size = 32\n\n\ndef get_inputs():\n    return [torch.randint(0, num_embeddings, (batch_size, seq_length), dtype=torch.long)]\n\n\ndef get_init_inputs():\n    return [num_embeddings, embedding_dim]",
+    "row_index": 368,
+    "source_hash": "2c9b25fa3aa39df4b98607230457abd18ed22635a3a53c1eddb0a165733e8027",
+    "normalized_hash": "9c9053934a250410951d04879a3c0510db8ebab8134ecddae35702d18778b0f3",
+    "task_id": "ops6k-9c9053934a250410",
+    "split": "train"
+  }
+]

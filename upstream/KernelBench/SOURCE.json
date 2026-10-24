@@ -1,0 +1,6 @@
+{
+  "url": "https://github.com/ScalingIntelligence/KernelBench",
+  "revision": "423217d9fda91e0c2d67e4a43bf62f96f6d104f1",
+  "archive_sha256": "600b6b145f18ff63a4e6a24a4959caad386266aa0246b1ccd18e134bab29a2eb",
+  "contents": "task sources and root attribution files; no benchmark execution in P1"
+}

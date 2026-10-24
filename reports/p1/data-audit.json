@@ -1,0 +1,47 @@
+{
+  "train_ratio": 0.8,
+  "split_unit": "normalized_source_group",
+  "pilot_split": "train",
+  "raw_sha256": "d4404fc181cad72081f8c1cba720cc1b511fb34dee924079e898bf1e83f6257c",
+  "revision": "44a734c78c947bfcba5189cbfd13f57a6d29a698",
+  "rows": 6000,
+  "unique_groups": 5542,
+  "syntax_or_interface_invalid": [],
+  "group_splits": {
+    "test": 1108,
+    "train": 4434
+  },
+  "row_splits": {
+    "train": 4803,
+    "test": 1197
+  },
+  "source_counts": {
+    "torch#4": 168,
+    "torch#5": 74,
+    "torch#3": 457,
+    "torch#1": 204,
+    "torch#2": 5026,
+    "transformers": 71
+  },
+  "kernelbench_counts": {
+    "level1": 100,
+    "level2": 100,
+    "level3": 50
+  },
+  "pilot_task_ids": [
+    "ops6k-939f4a6e2eab9f49",
+    "ops6k-4b30bedf7b666818",
+    "ops6k-f9da864ce17744c9",
+    "ops6k-9fbe88dcf4053fa4",
+    "ops6k-7872d67c6198c50a",
+    "ops6k-f3750b017c78d8f0",
+    "ops6k-51844277a90906e9",
+    "ops6k-b56ae5cf14573644",
+    "ops6k-d5903209a0ffe947",
+    "ops6k-030adfe946c4729a",
+    "ops6k-4ac775908ca38f43",
+    "ops6k-9c9053934a250410"
+  ],
+  "similarity_method": "AST node type/name trigrams Jaccard; screening evidence, not proof of no contamination",
+  "exact_matches": 0
+}
