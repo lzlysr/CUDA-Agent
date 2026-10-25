@@ -8,10 +8,10 @@
 
 # 启用严格模式：命令失败或变量未定义时退出，管道中任一命令失败也视为失败。
 set -euo pipefail
-R=/home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+R=/home/likun/junjxu/CUDA-Agent
 cd "$R"
 # 在当前 Bash 中加载 Conda 的 Shell 函数，让下一行可以执行 conda activate。
-source /home/likun/miniconda3/etc/profile.d/conda.sh
+source /data2/likun/miniconda/etc/profile.d/conda.sh
 conda activate "$R/.runtime/conda/learner"
 # 在当前 Shell 中加载项目的 CUDA、缓存和临时目录配置。
 source scripts/set-env.sh

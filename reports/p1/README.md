@@ -5,7 +5,7 @@
 ## 只看 eager/torch.compile
 
 ```bash
-cd /home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+cd /home/likun/junjxu/CUDA-Agent
 # 列题，不启动 GPU。
 bash scripts/p1-baseline.sh --list --split train --limit 12
 # 预览将测量的任务，不启动 GPU。
@@ -21,7 +21,7 @@ bash scripts/p1-baseline.sh --split train --limit 1 --gpu 3
 当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner，使用 GPU 2 生成、GPU 3 评测，均按编号选择。128K GPU 流程仍需实际运行验证。
 
 ```bash
-cd /home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+cd /home/likun/junjxu/CUDA-Agent
 # 启动真实模型实验，使用新的输出目录。
 bash scripts/p1-run.sh --run runs/p1/pilot-train-v3
 ```

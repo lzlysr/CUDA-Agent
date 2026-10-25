@@ -2,7 +2,7 @@
 # 运行：在 Bash 中 source scripts/set-env.sh
 # 输入：当前环境变量；输出：导出的路径与 CUDA 配置。单独 source 时默认 GPU 4（P0）。
 
-export CUDA_AGENT_ROOT=/home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+export CUDA_AGENT_ROOT=/home/likun/junjxu/CUDA-Agent
 # 清除可能继承的旧 GPU UUID 变量，后续按 GPU 编号选择设备。
 unset CUDA_AGENT_GPU_UUID
 # 让 CUDA 按 PCI 总线顺序枚举设备，保持设备枚举顺序稳定。

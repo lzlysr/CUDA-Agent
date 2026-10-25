@@ -1,4 +1,4 @@
--e /home/likun/junjxu/zhuolin/workspace/CUDA-Agent/third_party/verl
+-e /home/likun/junjxu/CUDA-Agent/third_party/verl
 absl-py==2.5.1
     # via tensorboard
 accelerate==1.15.0

@@ -2,7 +2,7 @@
 
 完成时间：2026-10-17T08:00:45.599852+00:00。本轮仅执行单卡 P0，没有启动正式训练。
 
-服务器：`air-1`；项目目录：`/home/likun/junjxu/zhuolin/workspace/CUDA-Agent`；GPU：A100-SXM4-80GB，编号 4，UUID `GPU-ac246f3e-147f-4145-cac6-ab33881f4308`。
+服务器：`air-1`；项目目录：`/home/likun/junjxu/CUDA-Agent`；GPU：A100-SXM4-80GB，编号 4，UUID `GPU-ac246f3e-147f-4145-cac6-ab33881f4308`。
 
 ## 最终环境
 
@@ -65,8 +65,8 @@ conda activate .runtime/conda/learner
 任意目录均可使用：
 
 ```bash
-conda activate /home/likun/junjxu/zhuolin/workspace/CUDA-Agent/.runtime/conda/kernel
-conda activate /home/likun/junjxu/zhuolin/workspace/CUDA-Agent/.runtime/conda/learner
+conda activate /home/likun/junjxu/CUDA-Agent/.runtime/conda/kernel
+conda activate /home/likun/junjxu/CUDA-Agent/.runtime/conda/learner
 ```
 
 环境提示符已配置为 `(kernel)` / `(learner)`。为支持直接 conda activate，设置了当前用户的 `env_prompt='({name}) '`；未修改全局 envs_dirs、系统 Python、系统 CUDA 或其他项目环境。

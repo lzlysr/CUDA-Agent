@@ -6,11 +6,11 @@
 # 启用严格模式：命令失败或变量未定义时退出，管道中任一命令失败也视为失败。
 set -euo pipefail
 # 记录服务器上的项目根目录，供后续定位环境、源码和输出目录。
-R=/home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+R=/home/likun/junjxu/CUDA-Agent
 # 切换到项目根目录，使后续 scripts、configs、data 等相对路径指向本项目。
 cd "$R"
 # 在当前 Bash 中加载 Conda 的 Shell 函数，让下一行可以执行 conda activate。
-source /home/likun/miniconda3/etc/profile.d/conda.sh
+source /data2/likun/miniconda/etc/profile.d/conda.sh
 # 激活项目内的 learner Conda 环境，使用其中的 Python 和控制器依赖。
 conda activate "$R/.runtime/conda/learner"
 # 在当前 Shell 中加载项目的 CUDA、缓存和临时目录配置；下一步会覆盖默认 GPU 设置。

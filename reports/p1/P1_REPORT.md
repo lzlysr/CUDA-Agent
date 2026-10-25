@@ -1,6 +1,6 @@
 # P1 基线：当前方案与运行说明
 
-更新日期：2026-10-24。服务器项目根目录：`/home/likun/junjxu/zhuolin/workspace/CUDA-Agent`。
+更新日期：2026-10-24。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
 
 本文整合当前的数据、模型、工具、评测协议及运行方法。模型正确率、加速比和成本等实际结果，以接下来新建运行目录中的输出为准。
 
@@ -48,7 +48,7 @@ P1 测量原始 Qwen3.5-9B 在 CUDA 代码生成上的起点，尚不更新模�
 `data-audit.json` 由 `src/p1/data.py` 的 `prepare()` 调用 `dump()` 自动生成，不是实验结果，也不需要手工维护。执行以下命令会重新生成上述数据及审计，并额外写出 `reports/p1/kernelbench-similarity.json` 的逐题源码相似性记录；只运行 CPU 数据处理。
 
 ```bash
-cd /home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+cd /home/likun/junjxu/CUDA-Agent
 conda activate .runtime/conda/learner
 # 处理原始数据，生成划分、train pilot 和审计文件，不启动模型或 GPU。
 PYTHONPATH=src python -B -m p1.data
@@ -167,7 +167,7 @@ python3 -m utils.profiling
 ### 7.1 仅测 eager/torch.compile
 
 ```bash
-cd /home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+cd /home/likun/junjxu/CUDA-Agent
 # 列出 train 中排序后的前 12 个任务，不启动 GPU。
 bash scripts/p1-baseline.sh --list --split train --limit 12
 # 预览测量任务和 GPU 编号，不启动 GPU。
@@ -183,7 +183,7 @@ baseline 入口默认创建带时间戳的独立目录。这里的 `--limit 12` 
 启动脚本会加载 Conda 并激活 learner，无需额外 activate.sh。先确认 GPU 2、3 可用；当前控制器会检查两卡显存占用，超过 100 MiB 时拒绝启动，并要求项目所在文件系统至少有 80 GiB 可用空间。
 
 ```bash
-cd /home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+cd /home/likun/junjxu/CUDA-Agent
 # 启动当前 train pilot，GPU 2 生成、GPU 3 评测；该命令会执行真实实验。
 bash scripts/p1-run.sh --run runs/p1/pilot-train-v3-seed42
 ```
@@ -319,13 +319,13 @@ flowchart TD
 
 ```bash
 # 在服务器项目根目录启动一题真实基线测量，使用 GPU 3。
-bash /home/likun/junjxu/zhuolin/workspace/CUDA-Agent/scripts/p1-baseline.sh --split train --limit 1 --gpu 3
+bash /home/likun/junjxu/CUDA-Agent/scripts/p1-baseline.sh --split train --limit 1 --gpu 3
 ```
 
 启动脚本依次做以下事情：
 
 1. 开启 Bash 严格模式并切换到固定项目根目录，使命令失败及时退出、相对路径保持一致。
-2. 加载 `/home/likun/miniconda3/etc/profile.d/conda.sh`，激活项目 `.runtime/conda/learner`。
+2. 加载 `/data2/likun/miniconda/etc/profile.d/conda.sh`，激活项目 `.runtime/conda/learner`。
 3. source 公共 `set-env.sh`，设置 CUDA_HOME、PATH、缓存目录和线程等环境变量。这里只设置变量，不会初始化 CUDA 或开始计算。
 4. 把宿主 `CUDA_VISIBLE_DEVICES` 覆盖为空。公共脚本中的 P0 默认 GPU 4 不会用于本次计算；真正的 GPU 由后面 Docker 的 `--gpus device=3` 指定。
 5. 将项目 src 加入 PYTHONPATH，执行 `python -B -m p1.baseline "$@"`。`-B` 禁止写入 pyc，`"$@"` 保留原始命令行参数。
@@ -522,7 +522,7 @@ baseline 不生成模型 pilot 的 summary.json，也没有 Agent 轨迹；不�
 
 ```bash
 # 切换到项目根目录。
-cd /home/likun/junjxu/zhuolin/workspace/CUDA-Agent
+cd /home/likun/junjxu/CUDA-Agent
 # 只确认将要运行的第一道 train 任务，不使用 GPU。
 bash scripts/p1-baseline.sh --list --split train --limit 1
 # 只预览题目及 GPU 选择，不检查 GPU 占用、不创建运行目录。
