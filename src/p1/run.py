@@ -486,6 +486,27 @@ class Pilot:
                 return item, hidden
         return None, last_hidden
 
+    def save_result_summaries(self):
+        """将内存中的逐题结果写为摘要和详情路径；完整轨迹继续保存在各自 result.json。
+
+        只保留标量字段，省去 final_evaluation、hidden_evaluation、events 等嵌套副本。
+        详情路径相对于本次 run 根目录；不修改内存结果，保证后续统计仍可使用完整数据。
+        """
+        rows = []
+        for result in self.results:
+            row = {
+                key: value
+                for key, value in result.items()
+                if value is None or isinstance(value, (str, int, float, bool))
+            }
+            if result["mode"] == "reference":
+                detail = self.run / "references" / result["task_id"] / "preflight.json"
+            else:
+                detail = self.run / "trajectories" / result["task_id"] / result["mode"] / "result.json"
+            row["detail_path"] = detail.relative_to(self.run).as_posix()
+            rows.append(row)
+        dump(self.run / "results.json", rows)
+
     def execute(self, prepare_only=False):
         """输入是否仅预检；保存运行题单、评测两种模式并汇总，返回 None；不自动扩展数据集。"""
         task_file = self.run / "tasks.json"
@@ -512,6 +533,7 @@ class Pilot:
                 for p in (ROOT / "src/p1").rglob("*")
                 if p.is_file() and p.suffix in {".py", ".sh"}
             },
+            "task_count": len(tasks),
             "task_ids": [t["task_id"] for t in tasks],
             "protocol": self.cfg.get("protocol_version", "controlled-tf32"),
             "status": "running",
@@ -522,7 +544,7 @@ class Pilot:
         for task in tasks:
             dest = self.run / "references" / task["task_id"] / "preflight.json"
             pre = json.loads(dest.read_text()) if dest.exists() else self.ev.prepare(task)
-            dump(dest, pre)
+            # 新预检索引由 Evaluator.prepare 写入；已有缓存只读取，不再复制详情。
             if pre["status"] == "ok":
                 eligible.append(task)
             else:
@@ -531,10 +553,12 @@ class Pilot:
                         "task_id": task["task_id"],
                         "mode": "reference",
                         "status": "task_invalid",
-                        "detail": pre,
+                        "detail_path": dest.relative_to(self.run).as_posix(),
                     }
                 )
             print("PREFLIGHT", task["task_id"], pre["status"], flush=True)
+        # 预检失败也在根目录保留逐题摘要，仅准备模式不丢失状态记录。
+        self.save_result_summaries()
         if prepare_only:
             return
         self.model()
@@ -547,7 +571,7 @@ class Pilot:
                     print("START", task["task_id"], mode, flush=True)
                     res = self.trajectory(task, mode, index)
                 self.results.append(res)
-                dump(self.run / "results.json", self.results)
+                self.save_result_summaries()
                 print(
                     "RESULT", task["task_id"], mode, res["correct"], res["termination"], flush=True
                 )

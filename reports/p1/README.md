@@ -1,6 +1,6 @@
 # P1 入口
 
-更新日期：2026-10-24。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。
+更新日期：2026-10-26。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
 
 ## 只看 eager/torch.compile
 
@@ -15,6 +15,27 @@ bash scripts/p1-baseline.sh --split train --limit 1 --gpu 3
 ```
 
 结果写入新建的 `runs/p1/baseline-<时间>/`，包含 JSON、CSV、REPORT.md、eager/compile 稳态时间、compile 首调时间及 profiler。`--limit` 选的是排序后的 train 任务，不等同于模型 pilot；指定题目可使用 `--task-id`。
+
+### 多卡与断点续跑
+
+以下卡号为示例，请先确认空闲；不指定卡号的新运行仍默认 GPU 7。
+
+```bash
+# 两张卡各自串行处理独立题目，不加载 Qwen，也不是单题多卡计算。
+bash scripts/p1-baseline.sh --split train --limit 100 --gpus 2,3 --run runs/p1/baseline-multi
+# 恢复预览：只读原题单和阶段文件，不查询或启动 GPU。
+bash scripts/p1-baseline.sh --resume --run runs/p1/baseline-multi --gpus 2,3 --dry-run
+# 在原目录继续，可更换空闲卡；题单、容差、轮数和种子沿用原 manifest。
+bash scripts/p1-baseline.sh --resume --run runs/p1/baseline-multi --gpus 2,3
+```
+
+`--gpu 3` 与 `--gpus 2,3` 二选一；只接受编号，重复编号会报错。续跑不再传 `--split/--limit/--task-id`。
+多卡仍只保留一份 `worker-config.json`，公共参数只读共享，实际卡号由宿主单独传给 Docker。
+原有运行文件不迁移或改名；新的运行锁位于项目 `.runtime/locks`，不在 run 内新增锁文件。
+成功和明确拒绝的题都跳过；未完成题先归档至原 run 的 `interrupted/` 再重做。
+Ctrl+C 或向控制器发 TERM 会停止派新题，等待各卡当前题结束保存后退出，最坏可能还需等待当前的两个 300 秒阶段。
+根汇总损坏或丢失可从完整阶段详情重建；每个 JSON/CSV/Markdown 文件均原子替换，三文件并非跨文件事务。
+已有旧版进程不具备新停止机制，不会自动切换多卡；恢复前须先结束原进程。详细行为和限制见报告第 12 节。
 
 ## 运行 Qwen single/agent pilot
 
@@ -64,3 +85,9 @@ PYTHONPATH=src python -B tests/p1/sandbox_smoke.py
 - `reports`：当前统一报告、入口说明和数据审计。
 
 本次整理没有启动实验或定时任务。完整 test、KernelBench 和 P2 训练不由以上 pilot 命令自动扩展执行。
+
+## 基线汇总的均值行
+
+新基线运行的 JSON 首条记录、CSV/Markdown 表格首个数据行均为 MEAN，统计各数值指标的算术均值并记录处理/成功/拒绝数量。
+均值按成功样本中每列实际存在的有限值计算，不把拒绝或缺失值补零；manifest 在 task_ids 前记录 task_count。
+三种汇总逐题共同更新，REPORT 另列拒绝阶段和原因；完整错误仍保存在阶段详情中。

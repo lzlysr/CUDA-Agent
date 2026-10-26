@@ -1,6 +1,6 @@
 # P1 基线：当前方案与运行说明
 
-更新日期：2026-10-24。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
+更新日期：2026-10-26。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
 
 本文整合当前的数据、模型、工具、评测协议及运行方法。模型正确率、加速比和成本等实际结果，以接下来新建运行目录中的输出为准。
 
@@ -363,15 +363,15 @@ return torch.logsumexp(x, dim=1, keepdim=False)
 |---|---|---|
 | `--list` | 选题并打印 ID/ops，随后返回，甚至不读取公共配置 JSON | 否 |
 | `--dry-run` | 选题、读配置、应用 --gpu 覆盖并打印选中 ID/评测 GPU | 否；也不会核验 GPU 当前是否空闲 |
-| 不带上述参数 | 先要求显式 --gpu，检查占用，再创建目录并真正执行 | 是 |
+| 不带上述参数 | 检查指定卡后创建目录并执行；新运行不传卡号时默认 GPU 7 | 是 |
 
 ### 11.5 配置实际如何生效
 
-真实运行中，`--gpu 3` 会把读入内存的 `evaluation_gpu` 改为 3，不会修改磁盘上的 `p1-pilot.json`。随后调用 nvidia-smi 检查指定卡的显存使用，超过 100 MiB 时拒绝启动；不会结束已有进程。该检查不等于对 GPU 加独占锁，不能阻止其他任务在测量过程中进入。
+真实运行中，`--gpu 3` 会把读入内存的 `evaluation_gpu` 改为 3，不会修改磁盘上的 `p1-pilot.json`。多卡可使用 `--gpus 2,3`，各评测器独立持有实际卡号，共用同一份只读 `worker-config.json`。调用 nvidia-smi 检查指定卡的显存使用，沿用当前代码中用户设置的 60000 MiB 阈值；不会结束已有进程。该阈值不能证明 GPU 空闲，正式测时仍应选择无其他任务干扰的卡。新增文件锁只协调同项目新版基线控制器，无法阻止其他程序使用 GPU。
 
 | 配置或代码设置 | 在 baseline 中的实际作用 |
 |---|---|
-| `evaluation_gpu` | 选择评测 GPU，真实运行时必须通过 --gpu 明确指定 |
+| `evaluation_gpu` | 单卡用 --gpu 选择；多卡用 --gpus 列表分配；新运行不传时保留入口默认 GPU 7 |
 | `docker_image` | 选择已存在的固定镜像；--pull=never 不自动拉取 |
 | `atol=0.01`、`rtol=0.01` | 近常数筛查及 compiled/eager 输出比较的容差 |
 | `feedback_cases=5` | 基线测时轮换的输入数，也是 compiled/eager 比较的案例数 |
@@ -389,11 +389,11 @@ return torch.logsumexp(x, dim=1, keepdim=False)
 
 ### 11.6 新建输出目录并准备参考任务
 
-GPU 检查通过后，`run_baselines()` 新建输出目录。默认形如 `runs/p1/baseline-<时间戳>`；时间戳由代码按 UTC 生成，不是北京时间。也可用 `--run` 指定目录。目录已存在时拒绝覆盖，本入口没有 --resume 参数。
+GPU 检查通过后，`run_baselines()` 新建输出目录。默认形如 `runs/p1/baseline-<时间戳>`，显式使用北京时间 UTC+8；也可用 `--run` 指定目录。目录已存在时拒绝覆盖，需要通过 `--resume --run <目录>` 显式恢复。续跑从原 manifest 读题单和配置，不重新按当前 --limit 选题，详见第 12 节。
 
 控制器先写出：
 
-- `worker-config.json`：实际传给 worker 的配置，包含 --gpu 的覆盖结果。
+- `worker-config.json`：各卡共享的只读 worker 配置，由主控制器在线程启动前写一次，单卡/多卡均保持原文件名。实际卡号由宿主的 `Evaluator.gpu` 单独传给 Docker。
 - `manifest.json`：记录 mode=reference_only、完整配置、所选 task_ids，以及 loads_qwen=false。
 
 然后逐题调用 `Evaluator.profile_reference(task)`。新目录没有该题的参考快照，因此进入 `Evaluator.prepare(task)`：
@@ -413,7 +413,7 @@ GPU 检查通过后，`run_baselines()` 新建输出目录。默认形如 `runs/
 | `.runtime/conda/kernel` | 同一绝对路径，只读 | 实际 Python、PyTorch、Ninja 等依赖 |
 | `/usr/local/cuda-12.9` | 同一路径，只读 | CUDA Toolkit |
 | `src/p1/worker.py` | `/worker.py`，只读 | 当前项目的执行代码 |
-| run 的 worker-config.json | `/config.json`，只读 | 运行参数 |
+| run 的 worker-config.json | `/config.json`，只读 | 各卡共用的评测参数；实际设备由 Docker --gpus 单独指定 |
 | 该题 references 目录 | `/reference`，只读 | 参考源码和已有文件 |
 | 该阶段的输出目录 | `/outputs`，可写 | 结果、日志、参数快照 |
 | cases/input-spec（测量阶段） | `/inputs`，只读 | 重建模型和输入所需的源码及参数 |
@@ -474,47 +474,62 @@ GPU 检查通过后，`run_baselines()` 新建输出目录。默认形如 `runs/
 
 ```text
 baseline-<时间>/
-├── manifest.json                 # 本次模式、配置、题单；明确不加载 Qwen
-├── worker-config.json            # 实际传给容器的配置
-├── results.json                  # 每完成一题即更新，含完整 detail
-├── results.csv                   # 全部题处理完后生成，便于表格分析
-├── REPORT.md                     # 全部题处理完后的简表
+├── manifest.json                 # 本次模式、配置、task_count、题单；明确不加载 Qwen
+├── worker-config.json            # 各卡共用的只读配置，单卡/多卡均保留此名称
+├── results.json                  # 首条记录为 MEAN，后续为各题摘要及 detail_path
+├── results.csv                   # 保留表头，首个数据行为 MEAN，逐题更新
+├── REPORT.md                     # 表格首个数据行为 MEAN，含拒绝原因，逐题更新
 └── references/<task_id>/
     ├── model.py                  # 从本次 JSON 任务记录导出的参考源码
-    ├── prepare.json              # 预检结果，含控制器耗时
-    ├── preflight.json            # 综合预检/初始测量状态及原因
-    ├── baseline.json             # 初始 eager/compile 测量的详细结果
+    ├── preflight.json            # 仅保存状态及阶段结果路径
     ├── cases/
     │   ├── worker.log            # 第一个容器的标准输出和错误
-    │   ├── result.json           # 第一个 worker 的原始结果
+    │   ├── prepare_result.json   # 完整预检结果，含 controller_seconds
     │   └── input-spec/
     │       ├── model.py          # 用于后续模型和输入重建的源码
     │       └── state-*.pt        # 各初始化种子的参数快照
     ├── initial-bench/
     │   ├── worker.log            # 第二个容器的标准输出和错误
-    │   └── result.json           # 第二个 worker 的原始结果
+    │   └── bench_result.json     # 完整测时结果，含 controller_seconds
     └── compile-cache/
         ├── inductor/            # TorchInductor 缓存（按实际生成）
         └── triton/              # Triton 缓存（按实际生成）
 ```
 
+`preflight.json` 的结构示例：
+
+```json
+{
+  "status": "ok",
+  "prepare_result_path": "references/<task_id>/cases/prepare_result.json",
+  "bench_result_path": "references/<task_id>/initial-bench/bench_result.json"
+}
+```
+
+上述路径以及根目录 `results.json` 的 `detail_path` 都相对于本次 run 根目录。
+参考预检未通过时不会生成测时结果，也不会写入 `bench_result_path`；拒绝原因在预检详情文件中。若初始测时本身失败，仍保留 `bench_result_path` 指向失败记录。
+根目录不再嵌套完整 `detail`；成功题的详情路径指向 `bench_result.json`，拒绝题指向 `preflight.json`。
+Agent run 的根目录 `results.json` 同样只保留各题/模式的标量摘要和轨迹详情路径；完整轨迹结果仍在 `trajectories/<task_id>/<mode>/result.json`。
+各次额外参考测时（profile、前后基线）的阶段文件也统一使用 `bench_result.json`。
+这些约定只用于后续运行，本次不迁移或删除已有 runs 结果。
+
 JSON 中关键性能字段：
 
 | 字段 | 怎么理解 |
 |---|---|
-| `status` | 先判断是否 ok；否则阅读 detail 和逐阶段日志 |
+| `status` | 先判断是否 ok；否则沿 detail_path 阅读详情和逐阶段日志 |
 | `eager_cuda_ms` / `compile_cuda_ms` | 两种执行方式的稳态 CUDA event 耗时，毫秒 |
 | `eager_wall_ms` / `compile_wall_ms` | 两种执行方式的同步墙钟耗时，毫秒 |
 | `compile_over_eager_speedup` | eager_cuda_ms ÷ compile_cuda_ms；大于 1 表示 compile 更快 |
-| `detail.compile_first_call_seconds` | 编译包装及首调耗时，秒，注意与 ms 的单位区别 |
-| `detail.compile_correct` | 编译前后输出比较是否通过 |
-| `detail.profiles` | eager/compile 的算子或事件统计，device_us 使用微秒 |
-| `detail.tf32_before/after`、`detail.state_mutations` | 精度状态记录 |
-| `detail.controller_seconds` | 该测量容器从启动至收尾的控制器墙钟时间，不是单次 kernel 时间 |
+| `compile_first_call_seconds`（详情文件） | 编译包装及首调耗时，秒，注意与 ms 的单位区别 |
+| `compile_correct`（详情文件） | 编译前后输出比较是否通过 |
+| `profiles`（详情文件） | eager/compile 的算子或事件统计，device_us 使用微秒 |
+| `tf32_before/after`、`state_mutations`（详情文件） | 精度状态记录 |
+| `controller_seconds`（详情文件） | 该测量容器从启动至收尾的控制器墙钟时间，不是单次 kernel 时间 |
 
 例如 eager=2 ms、compile=1 ms，则加速比为 2；这是解释字段的假设数字，不是实测结果。若 compile=3 ms，加速比约 0.67，表示该配置下 compiled 更慢，不代表计时必然有错。
 
-worker 以 JSON 返回的错误通常会被汇总后继续处理后面的任务；宿主发生未捕获异常仍可能终止整个程序。运行中优先看终端逐题结果与 results.json，结束后再看 CSV/REPORT。尚未完成第一题时没有 results.json、或中断时尚未产生 CSV/REPORT，都不等于没有保存任何阶段日志。
+worker 以 JSON 返回的错误通常会被汇总后继续处理后面的任务；宿主发生未捕获异常仍可能终止整个程序。运行中优先看终端逐题结果与 results.json，CSV/REPORT 与 JSON 每完成一题共同更新；尚未完成首题时，MEAN 记录的已处理数为 0。阶段日志仍可独立查看。
 
 baseline 不生成模型 pilot 的 summary.json，也没有 Agent 轨迹；不要用模型 pilot 的状态汇总口径解读它。
 
@@ -548,3 +563,81 @@ bash scripts/p1-baseline.sh --task-id ops6k-00192d5b7124134b --gpu 3 --run runs/
 - 当前 baseline 汇总主要按 worker 的 status 取数，记录的 TF32 状态变化也没有在该入口额外统一转为失败；完整的非正/非有限时间和状态审核主要位于候选评测路径。因此解读结果时仍应检查详细时间、compile_correct 和精度状态，不能仅见 status=ok 就视为覆盖所有测量有效性条件。
 - 预检、时钟、编译缓存及 PyTorch 版本都会影响测量；本次只测选定任务和当前机器，不代表全部 train/test 的平均水平。
 - 这次结果可以告诉你原始 PyTorch 和自动编译优化的性能起点，不能据此评估 Qwen 的 CUDA 编程能力或论文 RL 的提升。
+
+### 11.13 均值与样本数量
+
+`manifest.json` 在 `task_ids` 前写入 `task_count`，表示本次选中的去重任务数，包含后续被拒绝的题。
+`results.json` 首条记录为 `task_id="MEAN"`；CSV 和 Markdown 保留表头，首个数据行为均值。
+均值行的 `sample_count`、`valid_sample_count`、`rejected_sample_count` 分别表示已处理、成功、未通过的样本数，不将 MEAN 本身算作样本。
+每个数值指标只对成功样本中实际存在的有限数值计算算术均值，缺失、NaN、Inf 和拒绝样本不补零；无有效数据时 JSON 使用 null，CSV 留空，Markdown 使用 —。
+各题加速比的算术均值不等于 eager 平均耗时除以 compile 平均耗时；此处按逐题加速比求均值。
+除原有五项耗时/加速指标外，摘要补充 `compile_first_call_seconds` 和 `controller_seconds`，与稳态毫秒耗时区分。
+拒绝样本保留 `detail_path`，并增加 `rejection_stage`、`rejection_reason`；REPORT 的拒绝表可追踪各阶段证据。
+`reference_rejected` 是当前控制器的统一状态，既可能是近常数或非有限输出，也可能是环境显存不足、输入/参数设备混用、安全反序列化或比较器异常，不能都理解为题目本身无效。
+
+## 12. 纯基线的断点续跑与多卡执行
+
+本节对应 `src/p1/baseline.py`、`src/p1/baseline_state.py` 的调度与持久化扩展，不修改参考输入、容差、编译方式或测时轮数，不启动 Qwen/Agent。未自动停止、恢复或重跑已有实验，也未修改旧运行的中间结果。
+
+### 12.1 怎么运行
+
+```bash
+cd /home/likun/junjxu/CUDA-Agent
+# 新建多卡运行；示例卡号需要先确认空闲，每张卡独立处理一题。
+bash scripts/p1-baseline.sh --split train --limit 100 --gpus 2,3 --run runs/p1/baseline-multi
+# 只读预览：查看固定题单、可复用数量和待处理数量，不启动或查询 GPU。
+bash scripts/p1-baseline.sh --resume --run runs/p1/baseline-multi --gpus 2,3 --dry-run
+# 继续原目录剩余题目；也可只指定 --gpu 7 进行单卡续跑。
+bash scripts/p1-baseline.sh --resume --run runs/p1/baseline-multi --gpus 2,3
+```
+
+`--gpu` 和 `--gpus` 互斥；仅接受非负数字编号，不能重复。新运行不指定时保留 GPU 7 默认值。恢复不指定时使用原 manifest 的 `evaluation_gpu`，并不自动沿用此前多卡列表；建议恢复时明确传卡号。`--resume` 必须配合 `--run`，不能再传 `--split/--limit/--task-id`，防止把另一批题混进旧目录。
+
+对于 `runs/p1/baseline-20261025T223047` 这类由旧代码启动的运行，必须先让旧进程结束或自行停止，再使用同一目录的 `--resume`；当前仍在运行的旧进程不会动态获得新能力。只读预览可以在原运行期间执行。
+
+### 12.2 怎么判断“已完成”，为什么不会重测
+
+续跑先验证原 manifest：纯基线模式、原题单及顺序、原配置；卡号可换，其余配置保持不变。新运行额外保存各题源码/split 指纹及 worker、评测器、合同检查代码的指纹，发生变化时拒绝混合结果。旧 manifest 没有历史指纹，只能核对现存 `model.py` 与当前任务源码；首次恢复才补存当前指纹，不能反向证明旧运行完整的历史环境和代码身份。
+
+随后读取每题的正式阶段文件和预检索引，而非仅凭根 `results.json` 或 `input-spec` 目录存在判断：
+
+| 文件 | 恢复时检查什么 |
+|---|---|
+| `references/<id>/preflight.json` | 状态是否为终态，阶段路径是否确实属于本题标准路径 |
+| `cases/prepare_result.json` | 完整 JSON、预检状态、近常数标记、控制器补写的 controller_seconds |
+| `initial-bench/bench_result.json` | 需要测时时是否存在完整终态记录、控制器收尾和原有数值字段 |
+| 根 `results.json/CSV/REPORT.md` | 根据正式阶段详情重建；汇总丢失或截断不导致完整题重新运行 |
+
+成功、预检拒绝和已记录的测时失败/超时均算已完成，默认都跳过。恢复不会暗中重试拒绝题；若想另测此类题，显式新建 run。只有未完成或文件损坏的题才会重做：先将该题整个参考目录移至 `interrupted/<北京时间-随机后缀>/<id>/`，保留日志和编译缓存证据，然后从原始预检重新执行，避免残缺参数快照被误复用。归档中的中断成本不计入最终成功样本的性能均值。
+
+### 12.3 多卡具体并行什么
+
+主控制器维护同一份固定题单，每张指定卡最多执行一题；一题内仍按“参考预检 → eager/compile 测量”顺序执行，两种模式的性能来自同一张卡。某卡先结束就领取下一题，因此是动态分配，避免难题让静态分片一直拖尾。每个题目的源码、参数、日志与编译缓存目录独立；各卡共用同一份 `worker-config.json`，由主控制器在线程启动前写一次，各评测器只读挂载，不按卡号反复覆写。
+
+实际卡号保存在各宿主评测器的 `gpu` 属性中，由 Docker `--gpus device=编号` 选择。worker 不读取 `evaluation_gpu` 来选卡；公共 JSON 里的该字段保留原单卡默认值，实际多卡列表以 `manifest.execution.gpus` 为准，每条结果中的 `evaluation_gpu` 记录真正执行卡号。多卡续跑不会将原 `worker-config.json` 改名，也不生成按卡拆分的配置文件。
+
+汇总只由主控制线程写入，按原题单顺序排列，与任务完成先后无关；JSON 首行及 CSV/Markdown 首数据行仍为 MEAN。逐题摘要和阶段详情记录 `evaluation_gpu`，便于核对来源；旧阶段缺少此字段时按旧单卡 manifest 的卡号补记。每次完成一题后更新三种汇总及 manifest 的执行进度，不生成额外的逐题 checkpoint JSON 副本。
+
+这不是单个算子分布式计算，也不是 torch DataParallel。增加卡数会同时增加 CPU、宿主内存和编译压力；每个活动容器原有的 4 CPU/24 GiB 宿主内存限制仍保留，不能承诺线性加速。跨卡测量还受型号、频率、温度及其他任务影响；选相同型号且无外部负载的 GPU，保留卡号后再解读整体均值。
+
+### 12.4 中途停止、写盘及锁保护
+
+新版入口捕获 Ctrl+C/SIGINT 和发给控制器 PID 的 SIGTERM：停止派发新题，等待每张卡正在做的题完成并保存后退出，退出码 130；原队列中尚未启动的题保持待处理。Docker 客户端使用独立进程会话，防止前台 Ctrl+C 直接打断当前容器并被误记为题目错误。每题可能仍需完成两个最长各 300 秒的阶段，因此停止不是立即结束 GPU 工作。
+
+SIGKILL、关机或容器故障不保证当前题完成；下次恢复会归档未完成题后重做。若强制停止宿主后 Docker 容器仍在运行，续跑会检测其 run 挂载并拒绝继续，须等待或自行检查清理，不自动杀容器。
+
+| 文件/字段 | 用途 |
+|---|---|
+| `.runtime/locks/p1-baseline-run-<路径哈希>.lock` | flock 保护同一输出目录，锁文件放在 run 外；此前已有 controller.lock 的目录仍兼容原锁，不删除或改名 |
+| `.runtime/locks/p1-baseline-gpu-<编号>.lock` | 同项目新版基线之间协调卡号，阻止不同 run 同时用同一卡 |
+| `manifest.execution` | 状态 running/completed/interrupted/failed、当前卡号、复用/完成/待处理数量及北京时间 |
+| `manifest.task_fingerprints/protocol_fingerprints` | 固定任务身份与评测源码身份，避免续跑混用 |
+| 同目录隐藏 `.tmp` 文件 | 原子写入的临时产物，正常结束或写入异常后清理 |
+
+控制器写 JSON、CSV、Markdown 时先写同目录临时文件、fsync 后 os.replace。单文件不会因替换途中中断而只剩半份；三种汇总不构成跨文件事务，突然终止时可能相差最后一题，下一次恢复统一重建。旧版控制器没有锁，因此还要检查同项目旧进程；自动命名且无 --run 的旧进程无法可靠识别所属目录时，保守拒绝旧目录恢复。
+
+### 12.5 本次验证范围
+
+48 项 CPU 回归全部通过，覆盖：双卡确实同时处理不同题且同卡串行、停止后收齐当前题、续跑跳过成功与拒绝题、损坏汇总重建、半成品归档、旧格式 manifest 恢复、配置/数据/协议漂移拒绝、目录/卡号锁、原子替换失败保护、共享配置与独立卡号、续跑保留原文件名、SIGTERM 收尾及遗留容器识别。使用假评测器、临时目录和模拟 Docker 返回值；没有运行真实多卡 GPU 测时，真实环境下的吞吐收益尚未测量。
+
+本次配置共享改动只影响宿主配置传递和锁位置，不修改 worker 的数值与测时逻辑。上一版按卡拆配置的评测器代码指纹到当前版本有明确的兼容映射，续跑时更新 manifest 内容；未知评测器改动、worker 或 contract 指纹变化仍会拒绝。旧运行的现有文件不迁移、不改名；参考预检、测时结果以及三种汇总的文件名保持原样。
