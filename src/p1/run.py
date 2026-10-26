@@ -17,6 +17,7 @@ import time
 import traceback
 
 from .data import ROOT, dump, sha
+from .baseline_state import cleanup_reference_artifacts
 from .evaluation import Evaluator, InfrastructureError
 
 from .tools import TOOLS, WorkspaceTools
@@ -559,6 +560,10 @@ class Pilot:
             print("PREFLIGHT", task["task_id"], pre["status"], flush=True)
         # 预检失败也在根目录保留逐题摘要，仅准备模式不丢失状态记录。
         self.save_result_summaries()
+        # 预检拒绝的题不会进入 single/agent；状态保存后即可释放其参数和缓存。
+        for result in self.results:
+            if result["mode"] == "reference" and result["status"] == "task_invalid":
+                cleanup_reference_artifacts(self.run, result["task_id"])
         if prepare_only:
             return
         self.model()
@@ -575,6 +580,9 @@ class Pilot:
                 print(
                     "RESULT", task["task_id"], mode, res["correct"], res["termination"], flush=True
                 )
+            # single 和 agent 共用参数，须等两条轨迹及隐藏验收结束且摘要保存后再清理。
+            # 轨迹中断或仅 --prepare-only 时不会到这里，保留后续运行需要的参数。
+            cleanup_reference_artifacts(self.run, task["task_id"])
         summary = {
             "selected_tasks": len(tasks),
             "reference_valid": len(eligible),

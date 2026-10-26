@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import shutil
 import tempfile
 import uuid
 
@@ -252,3 +253,36 @@ def archive_incomplete(output, task_id):
     target.parent.mkdir(parents=True, exist_ok=True)
     ref.rename(target)
     return target.relative_to(output).as_posix()
+
+
+def cleanup_reference_artifacts(output, task_id):
+    """输入 run 和已完成题号；仅删除本题输入/参数快照及编译缓存，返回删除的相对路径。
+
+    调用方必须先持久保存本题最终结果，且确保本题没有正在运行的评测。
+    保留源码、预检索引、阶段 JSON 和日志，续跑仍可识别完成状态；重复调用无副作用。
+    所有目标先验证再删除；拒绝路径逃逸和目录符号链接，避免误删其他题或 run 外内容。
+    """
+    if not isinstance(task_id, str) or task_id in {"", ".", ".."} or Path(task_id).name != task_id:
+        raise ValueError("清理题号必须是单个目录名")
+    root = Path(output).resolve(strict=True)
+    ref = root / "references" / task_id
+    targets = [ref / "cases/input-spec", ref / "compile-cache"]
+    for target in targets:
+        # 包括父目录在内逐级拒绝符号链接，不跟随链接进入其他题或外部目录。
+        components = [root / "references", ref]
+        if target.name == "input-spec":
+            components.append(ref / "cases")
+        components.append(target)
+        if any(path.is_symlink() for path in components):
+            raise ValueError(f"清理目标或父目录不允许是符号链接：{target}")
+        resolved = target.resolve()
+        if not resolved.is_relative_to(ref) or resolved == ref:
+            raise ValueError(f"清理目标越出本题目录：{target}")
+        if target.exists() and not target.is_dir():
+            raise ValueError(f"清理目标不是目录：{target}")
+    deleted = []
+    for target in targets:
+        if target.exists():
+            shutil.rmtree(target)
+            deleted.append(target.relative_to(root).as_posix())
+    return deleted

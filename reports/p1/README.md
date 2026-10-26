@@ -33,6 +33,8 @@ bash scripts/p1-baseline.sh --resume --run runs/p1/baseline-multi --gpus 2,3
 多卡仍只保留一份 `worker-config.json`，公共参数只读共享，实际卡号由宿主单独传给 Docker。
 原有运行文件不迁移或改名；新的运行锁位于项目 `.runtime/locks`，不在 run 内新增锁文件。
 成功和明确拒绝的题都跳过；未完成题先归档至原 run 的 `interrupted/` 再重做。
+每题结果持久保存后，自动删除该题的 `cases/input-spec/` 和 `compile-cache/`。
+阶段 JSON、源码、日志和汇总保留，续跑依赖这些结果识别完成题，不要求参数快照仍存在。
 Ctrl+C 或向控制器发 TERM 会停止派新题，等待各卡当前题结束保存后退出，最坏可能还需等待当前的两个 300 秒阶段。
 根汇总损坏或丢失可从完整阶段详情重建；每个 JSON/CSV/Markdown 文件均原子替换，三文件并非跨文件事务。
 已有旧版进程不具备新停止机制，不会自动切换多卡；恢复前须先结束原进程。详细行为和限制见报告第 12 节。
@@ -48,6 +50,11 @@ bash scripts/p1-run.sh --run runs/p1/pilot-train-v3
 ```
 
 已有运行目录需显式 `--resume` 且配置一致；新实验不要恢复其他 run。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
+
+同一题的 single、agent 及最终隐藏验收全部结束、两条结果保存后，才删除共享的
+`references/<id>/cases/input-spec/`、`compile-cache/`；不删除轨迹、候选源码或结果文件。
+single 完成而 agent 中断时仍保留参数。`--prepare-only` 保留有效题参数供后续使用；
+预检拒绝的题在拒绝结果保存后清理。清理后的完成题如需重新测量或验收，应新建运行重建参数。
 
 ```bash
 conda activate .runtime/conda/learner

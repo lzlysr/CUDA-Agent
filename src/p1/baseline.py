@@ -25,7 +25,8 @@ from threading import Event
 from .data import ROOT
 from .baseline_state import (
     archive_incomplete, atomic_json as dump, atomic_text, beijing_now,
-    completed_reference, exclusive_lock, guard_active_containers, guard_legacy_controller,
+    cleanup_reference_artifacts, completed_reference, exclusive_lock,
+    guard_active_containers, guard_legacy_controller,
     protocol_fingerprints, protocol_matches, run_lock_path, task_fingerprints,
 )
 
@@ -254,6 +255,7 @@ def run_baselines(cfg, tasks, output, evaluator_factory=None, *, resume=False, g
     gpus 为物理编号列表，一卡一次只执行一题；stop_event 置位后不再派发新题，
     等当前题结束再退出。evaluator_factory(cfg, output) 供 CPU 测试注入，不用 GPU。
     返回值按原题单排序且不含 MEAN；文件首行仍为 MEAN。异常时保留已完成结果。
+    每题汇总保存后删除其 input-spec 和 compile-cache；仅保留结果、源码与日志。
     """
     output = Path(output).resolve()
     devices = list(gpus) if gpus is not None else [cfg.get("evaluation_gpu", 7)]
@@ -329,6 +331,9 @@ def run_baselines(cfg, tasks, output, evaluator_factory=None, *, resume=False, g
             dump(output / "manifest.json", manifest)
 
         save()
+        # 恢复上次在“结果写完、清理之前”中断的情况；完成题不再需要参数快照。
+        for task_id in completed:
+            cleanup_reference_artifacts(output, task_id)
         # 先落盘可恢复的题单；争卡失败时也保留合法 manifest，而非留下无法恢复的空目录。
         try:
             if pending:
@@ -381,6 +386,8 @@ def run_baselines(cfg, tasks, output, evaluator_factory=None, *, resume=False, g
                             row = result_row(task, future.result(), output, gpu)
                             completed[task["task_id"]] = row
                             save()
+                            # 必须先保存可恢复的结果，之后才能删本题的参数和编译缓存。
+                            cleanup_reference_artifacts(output, task["task_id"])
                             print(json.dumps(row, ensure_ascii=False), flush=True)
                         except Exception as error:
                             # 基础设施/控制器异常不伪装成题目失败；其他卡已在执行的结果仍收齐。
@@ -400,6 +407,7 @@ def run_baselines(cfg, tasks, output, evaluator_factory=None, *, resume=False, g
                     try:
                         completed[task["task_id"]] = result_row(task, future.result(), output, gpu)
                         save()
+                        cleanup_reference_artifacts(output, task["task_id"])
                     except Exception:
                         pass
         if failure is not None:
