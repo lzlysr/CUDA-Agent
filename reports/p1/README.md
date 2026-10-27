@@ -41,15 +41,17 @@ Ctrl+C 或向控制器发 TERM 会停止派新题，等待各卡当前题结束�
 
 ## 运行 Qwen single/agent pilot
 
-当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner，使用 GPU 2 生成、GPU 3 评测，均按编号选择。128K GPU 流程仍需实际运行验证。
+当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；默认 GPU 2 生成、GPU 3 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，按题并行，评测卡整组租用，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡吞吐和 128K GPU 流程仍需实际运行验证。
 
 ```bash
 cd /home/likun/junjxu/CUDA-Agent
+# 只读预览配置和题目数量，不查询或启动 GPU。
+bash scripts/p1-run.sh --run runs/p1/pilot-train-v3 --dry-run
 # 启动真实模型实验，使用新的输出目录。
 bash scripts/p1-run.sh --run runs/p1/pilot-train-v3
 ```
 
-已有运行目录需显式 `--resume` 且配置一致；新实验不要恢复其他 run。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
+已有运行目录需显式 `--resume`；允许更换生成/评测卡号及卡数，其余配置须一致；新实验不要恢复其他 run。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
 
 同一题的 single、agent 及最终隐藏验收全部结束、两条结果保存后，才删除共享的
 `references/<id>/cases/input-spec/`、`compile-cache/`；不删除轨迹、候选源码或结果文件。
@@ -85,7 +87,7 @@ PYTHONPATH=src python -B -m unittest discover -s tests/p1 -v
 PYTHONPATH=src python -B tests/p1/sandbox_smoke.py
 ```
 
-- `src`：数据、评测器、worker、工具、模型循环、基线入口和状态查询等实现。
+- `src`：数据、评测器、worker、工具、模型循环、基线入口和状态查询等实现；`src/p1/helper/` 集中保存状态持久化、运行锁和多卡调度辅助模块。
 - `scripts`：环境设置与启动入口；每条命令上一行说明用途。
 - `tests`：回归及集成测试代码；`gpu_*.py` 需显式运行，会使用 GPU。
 - `runs`：每次运行的固定题单、配置、原始轨迹、候选快照和结果。

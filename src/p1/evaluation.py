@@ -25,7 +25,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 import torch
 from .data import ROOT, sha
-from .baseline_state import atomic_json as dump
+from .helper.baseline_state import atomic_json as dump
 
 # 限制宿主 PyTorch 的 CPU 算子线程数，避免外部比较器占用过多 CPU。
 torch.set_num_threads(4)

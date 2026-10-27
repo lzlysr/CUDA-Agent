@@ -2,9 +2,12 @@
 
 运行：bash scripts/p1-run.sh --run runs/p1/<新目录>。
 输入：configs/p1-pilot.json、train pilot 和本地模型；输出：原始轨迹与结果。
-会启动 GPU 2 推理、GPU 3 评测；本模块导入本身不会加载 vLLM 模型。"""
+GPU 按配置的数字编号使用；--dry-run 只预览。本模块导入本身不会加载 vLLM 模型。"""
 
 import argparse
+from contextlib import ExitStack
+import multiprocessing
+import signal
 import json
 import math
 import os
@@ -16,8 +19,11 @@ import subprocess
 import time
 import traceback
 
-from .data import ROOT, dump, sha
-from .baseline_state import cleanup_reference_artifacts
+from .data import ROOT, sha
+from .helper.baseline_state import (
+    atomic_json as dump, beijing_now, cleanup_reference_artifacts, exclusive_lock, run_lock_path, guard_active_containers,
+)
+from .helper.pilot_parallel import gpu_roles
 from .evaluation import Evaluator, InfrastructureError
 
 from .tools import TOOLS, WorkspaceTools
@@ -107,23 +113,26 @@ def generation_budget(cfg, agent, prompt_tokens):
 
 
 class Pilot:
-    def __init__(self, cfg, run):
-        """输入配置和 run 路径；创建评测控制器与空推理状态，不加载语言模型。"""
+    def __init__(self, cfg, run, *, generation_gpu=None, evaluator=None):
+        """输入公共配置、run 及可选本进程卡号/评测器；初始化状态，不加载模型。"""
         self.cfg = cfg
         self.run = Path(run)
-        self.ev = Evaluator(cfg, self.run)
+        generation, evaluation = gpu_roles(cfg)
+        self.generation_gpu = generation[0] if generation_gpu is None else generation_gpu
+        self.ev = evaluator if evaluator is not None else Evaluator(cfg, self.run, gpu=evaluation[0])
         self.llm = None
         self.tokenizer = None
         self.results = []
         self.session = None
         self._search_evals = []
+        self.stop_event = None
 
     def model(self):
-        """无参数；按配置在 GPU 2 加载本地原始 BF16 模型及 tokenizer，返回 None。"""
+        """无参数；在本进程指定编号卡加载完整 BF16 模型及 tokenizer，返回 None。"""
         if self.llm is not None:
             return
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.cfg["generation_gpu"])
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.generation_gpu)
         os.environ["VLLM_NO_USAGE_STATS"] = "1"
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -146,6 +155,13 @@ class Pilot:
             limit_mm_per_prompt={"image": 0, "video": 0},
             seed=self.cfg["seed"],
         )
+
+    def close_model(self):
+        """无输入；退出前关闭本模型的推理引擎并释放引用，不影响其他进程的模型。"""
+        if self.llm is not None:
+            self.llm.llm_engine.engine_core.shutdown()
+            self.llm = None
+        self.tokenizer = None
 
     def generate(self, messages, tools, seed, out):
         """输入消息、是否启用工具、种子和日志路径；返回生成文本、token 数、停止原因和时间。"""
@@ -319,6 +335,8 @@ class Pilot:
         events = []
         max_turns = 1 if mode == "single" else self.cfg["max_turns"]
         for turn in range(max_turns):
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("停止当前未完成轨迹，保留中间文件供恢复归档")
             if (
                 self.cfg.get("trajectory_seconds") is not None
                 and time.monotonic() - started >= self.cfg["trajectory_seconds"]
@@ -426,6 +444,8 @@ class Pilot:
             events.append({"turn": turn, "tool": name, "elapsed": time.monotonic() - started})
             dump(out / "messages.json", messages)
         search_seconds = time.monotonic() - started
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise InterruptedError("停止后不再启动最终候选及隐藏验收")
         # 最终工作区也先验收；随后在所有测时有效的正确候选中按 compile 加速排序。
         final_work = self.ev.evaluate(task, work)
         measured, hidden = self.select_candidate(task, evals + [final_work])
@@ -442,6 +462,8 @@ class Pilot:
             "final_work_evaluation": final_work,
             "task_id": task["task_id"],
             "mode": mode,
+            "generation_gpu": self.generation_gpu,
+            "task_index": index,
             "termination": termination,
             "correct": final_correct,
             "feedback_correct": measured.get("correct", False),
@@ -508,16 +530,11 @@ class Pilot:
             rows.append(row)
         dump(self.run / "results.json", rows)
 
-    def execute(self, prepare_only=False):
-        """输入是否仅预检；保存运行题单、评测两种模式并汇总，返回 None；不自动扩展数据集。"""
-        task_file = self.run / "tasks.json"
-        tasks = json.loads(
-            (task_file if task_file.exists() else ROOT / "data/processed/pilot.json").read_text()
-        )
-        dump(task_file, tasks)
-        manifest = {
+    def make_manifest(self, tasks):
+        """输入固定题单；返回配置、源码指纹和北京时间运行清单，不加载模型。"""
+        return {
             "config": self.cfg,
-            "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "started_at": beijing_now().isoformat(timespec="seconds"),
             "git_head": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
             ).strip(),
@@ -540,9 +557,79 @@ class Pilot:
             "status": "running",
             "no_training": True,
         }
+
+    def finish_summary(self, tasks, eligible, manifest, *, costs=None, complete=True):
+        """输入题单、有效题、清单及可选并行成本；统一统计并写结果，返回 None。"""
+        summary = {
+            "selected_tasks": len(tasks),
+            "reference_valid": len(eligible),
+            "invalid_tasks": len(tasks) - len(eligible),
+            "modes": {},
+        }
+        for mode in ["single", "agent"]:
+            items = [x for x in self.results if x["mode"] == mode]
+            correct = [x for x in items if x["correct"]]
+            timed = [x for x in correct if x["timing_valid"]]
+            summary["modes"][mode] = {
+                "attempted": len(items),
+                "correct": len(correct),
+                "pass_rate_on_reference_valid": len(correct) / len(eligible) if eligible else None,
+                "pass_rate_on_selected": len(correct) / len(tasks) if tasks else None,
+                "timing_valid_correct": len(timed),
+                "faster_eager": sum(x["speedup_eager"] > 1 for x in timed),
+                "faster_compile": sum(x["speedup_compile"] > 1 for x in timed),
+                "gm_speedup_eager": (
+                    math.exp(statistics.mean(math.log(x["speedup_eager"]) for x in timed))
+                    if timed
+                    else None
+                ),
+                "gm_speedup_compile": (
+                    math.exp(statistics.mean(math.log(x["speedup_compile"]) for x in timed))
+                    if timed
+                    else None
+                ),
+                "generated_tokens": sum(x["generated_tokens"] for x in items),
+                "prefill_tokens_sum": sum(x["prefill_tokens_sum"] for x in items),
+                "tool_calls": sum(x["tool_calls"] for x in items),
+                "search_evaluations": sum(x["search_evaluations"] for x in items),
+                "search_seconds": sum(x["search_seconds"] for x in items),
+                "total_seconds": sum(x["total_seconds"] for x in items),
+            }
+        if costs is None:
+            costs = {
+                "container_seconds_this_invocation": self.ev.seconds,
+                "compiles_this_invocation": self.ev.compiles,
+                "generation_gpu_reserved_seconds": (
+                    time.monotonic() - self.model_started if hasattr(self, "model_started") else 0
+                ),
+            }
+        summary.update(costs)
+        summary["generation_gpu_reserved_hours"] = summary["generation_gpu_reserved_seconds"] / 3600
+        dump(self.run / "summary.json", summary)
+        manifest.update(
+            status="complete" if complete else "interrupted",
+            finished_at=beijing_now().isoformat(timespec="seconds")
+        )
+        dump(self.run / "manifest.json", manifest)
+        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+
+    def execute(self, prepare_only=False):
+        """输入是否仅预检；保存运行题单、评测两种模式并汇总，返回 None；不自动扩展数据集。"""
+        generation, evaluation = gpu_roles(self.cfg)
+        if len(generation) > 1 or len(evaluation) > 1:
+            from .helper.pilot_parallel import execute_parallel
+            return execute_parallel(self, prepare_only, self.stop_event)
+        task_file = self.run / "tasks.json"
+        tasks = json.loads(
+            (task_file if task_file.exists() else ROOT / "data/processed/pilot.json").read_text()
+        )
+        dump(task_file, tasks)
+        manifest = self.make_manifest(tasks)
         dump(self.run / "manifest.json", manifest)
         eligible = []
         for task in tasks:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("停止参考预检")
             dest = self.run / "references" / task["task_id"] / "preflight.json"
             pre = json.loads(dest.read_text()) if dest.exists() else self.ev.prepare(task)
             # 新预检索引由 Evaluator.prepare 写入；已有缓存只读取，不再复制详情。
@@ -565,10 +652,19 @@ class Pilot:
             if result["mode"] == "reference" and result["status"] == "task_invalid":
                 cleanup_reference_artifacts(self.run, result["task_id"])
         if prepare_only:
+            manifest.update(status="prepared", updated_at=beijing_now().isoformat(timespec="seconds"))
+            dump(self.run / "manifest.json", manifest)
             return
-        self.model()
+        needs_model = any(
+            not (self.run / "trajectories" / task["task_id"] / mode / "result.json").exists()
+            for task in eligible for mode in ("single", "agent")
+        )
+        if needs_model:
+            self.model()
         for index, task in enumerate(eligible):
             for mode in ["single", "agent"]:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise InterruptedError("停止派发新轨迹")
                 dest = self.run / "trajectories" / task["task_id"] / mode / "result.json"
                 if dest.exists():
                     res = json.loads(dest.read_text())
@@ -583,87 +679,106 @@ class Pilot:
             # single 和 agent 共用参数，须等两条轨迹及隐藏验收结束且摘要保存后再清理。
             # 轨迹中断或仅 --prepare-only 时不会到这里，保留后续运行需要的参数。
             cleanup_reference_artifacts(self.run, task["task_id"])
-        summary = {
-            "selected_tasks": len(tasks),
-            "reference_valid": len(eligible),
-            "invalid_tasks": len(tasks) - len(eligible),
-            "modes": {},
-        }
-        for mode in ["single", "agent"]:
-            items = [x for x in self.results if x["mode"] == mode]
-            correct = [x for x in items if x["correct"]]
-            timed = [x for x in correct if x["timing_valid"]]
-            summary["modes"][mode] = {
-                "attempted": len(items),
-                "correct": len(correct),
-                "pass_rate_on_reference_valid": len(correct) / len(eligible) if eligible else None,
-                "pass_rate_on_selected": len(correct) / len(tasks),
-                "timing_valid_correct": len(timed),
-                "faster_eager": sum(x["speedup_eager"] > 1 for x in timed),
-                "faster_compile": sum(x["speedup_compile"] > 1 for x in timed),
-                "gm_speedup_eager": (
-                    math.exp(statistics.mean(math.log(x["speedup_eager"]) for x in timed))
-                    if timed
-                    else None
-                ),
-                "gm_speedup_compile": (
-                    math.exp(statistics.mean(math.log(x["speedup_compile"]) for x in timed))
-                    if timed
-                    else None
-                ),
-                "generated_tokens": sum(x["generated_tokens"] for x in items),
-                "prefill_tokens_sum": sum(x["prefill_tokens_sum"] for x in items),
-                "tool_calls": sum(x["tool_calls"] for x in items),
-                "search_evaluations": sum(x["search_evaluations"] for x in items),
-                "search_seconds": sum(x["search_seconds"] for x in items),
-                "total_seconds": sum(x["total_seconds"] for x in items),
-            }
-        summary["container_seconds_this_invocation"] = self.ev.seconds
-        summary["compiles_this_invocation"] = self.ev.compiles
-        summary["generation_gpu_reserved_seconds"] = time.monotonic() - self.model_started
-        summary["generation_gpu_reserved_hours"] = summary["generation_gpu_reserved_seconds"] / 3600
-        dump(self.run / "summary.json", summary)
-        manifest.update(
-            status="complete", finished_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        )
-        dump(self.run / "manifest.json", manifest)
-        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+        self.finish_summary(tasks, eligible, manifest)
 
 
-def main():
-    """读取 --run/--resume/--prepare-only；核查配置和 GPU 占用后启动，返回 None。"""
-    p = argparse.ArgumentParser()
-    p.add_argument("--run", default="runs/p1/pilot-train-v3-seed42")
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--prepare-only", action="store_true")
-    a = p.parse_args()
-    cfg = json.loads((ROOT / "configs/p1-pilot.json").read_text())
-    manifest_path = ROOT / a.run / "manifest.json"
-    if manifest_path.exists():
-        if not a.resume:
-            raise RuntimeError(
-                "已有运行目录；若确需恢复，请显式传入 --resume，旧停止结果不会自动续跑"
-            )
-        previous = json.loads(manifest_path.read_text())
-        if previous.get("config") != cfg:
-            raise RuntimeError("配置与旧 run 不同，请使用新的运行目录")
-    if shutil.disk_usage(ROOT).free < 80 * 1024**3:
-        raise RuntimeError("/home free space below 80 GiB")
-    # 在创建 CUDA 上下文前按编号检查占用；不结束其他用户进程。
+def validate_resume(cfg, output, resume):
+    """输入当前配置、输出目录和续跑标志；检查旧配置，仅 GPU 调度字段允许更换。"""
+    manifest = output / "manifest.json"
+    if not manifest.exists():
+        if resume:
+            raise RuntimeError("--resume 指定目录没有 manifest.json")
+        if output.exists() and any(output.iterdir()):
+            raise RuntimeError("输出目录非空且没有清单，请使用新的运行目录")
+        return
+    if not resume:
+        raise RuntimeError("已有运行目录；恢复请显式传入 --resume")
+    saved = json.loads(manifest.read_text())
+    if saved.get("mode") == "reference_only":
+        raise RuntimeError("纯基线目录不能作为 Qwen pilot 续跑，请使用新的运行目录")
+    previous = saved["config"]
+    scheduling = {"generation_gpu", "evaluation_gpu"}
+    protocol = lambda value: {key: item for key, item in value.items() if key not in scheduling}
+    if protocol(previous) != protocol(cfg):
+        raise RuntimeError("模型、预算或评测配置与旧 run 不同，请使用新的运行目录")
+
+
+def check_gpu_devices(devices):
+    """输入将使用的物理编号；只读查询显存占用，编号不存在或占用超 100 MiB 时拒绝。"""
     rows = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=index,uuid,memory.used", "--format=csv,noheader,nounits"],
-        text=True,
+        ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+        text=True, timeout=30,
     )
-    devices = {
-        int(v[0]): (v[1].strip(), int(v[2]))
-        for v in [line.split(",") for line in rows.splitlines()]
-    }
-    for role in ["generation", "evaluation"]:
-        ident, used = devices[cfg[role + "_gpu"]]
-        if used > 100:
-            raise RuntimeError(f"{role} GPU is occupied: {used} MiB")
-    Pilot(cfg, ROOT / a.run).execute(a.prepare_only)
+    available = {int(parts[0]): int(parts[1])
+                 for parts in (line.split(",") for line in rows.splitlines())}
+    for gpu in devices:
+        if gpu not in available:
+            raise RuntimeError(f"GPU 编号不存在：{gpu}")
+        if available[gpu] > 100:
+            raise RuntimeError(f"GPU {gpu} 已占用 {available[gpu]} MiB；不会停止现有进程")
+
+
+def main(argv=None):
+    """输入可选 CLI 参数列表；预览或持目录/卡号锁运行，正常返回 0，安全停止返回 130。"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", default="runs/p1/pilot-train-v3-seed42")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="只读预览，不查询或启动 GPU")
+    args = parser.parse_args(argv)
+    cfg = json.loads((ROOT / "configs/p1-pilot.json").read_text())
+    generation, evaluation = gpu_roles(cfg)
+    output = (ROOT / args.run).resolve()
+    validate_resume(cfg, output, args.resume)
+    if args.dry_run:
+        task_path = output / "tasks.json"
+        tasks = json.loads((task_path if task_path.exists() else ROOT / "data/processed/pilot.json").read_text())
+        print(json.dumps({"run": str(output), "resume": args.resume,
+                          "prepare_only": args.prepare_only, "task_count": len(tasks),
+                          "generation_gpus": generation, "evaluation_gpus": evaluation,
+                          "generation_strategy": "one_model_replica_per_gpu"},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if shutil.disk_usage(ROOT).free < 80 * 1024**3:
+        raise RuntimeError("项目所在磁盘剩余空间不足 80 GiB")
+    lock_root = ROOT / ".runtime/locks"
+    # 与纯基线共用卡号锁，防止同项目的两种入口同时占用一张卡。
+    devices = evaluation if args.prepare_only else sorted(set(generation + evaluation))
+    with ExitStack() as locks:
+        locks.enter_context(exclusive_lock(run_lock_path(output, lock_root)))
+        if (output / "controller.lock").exists():
+            locks.enter_context(exclusive_lock(output / "controller.lock"))
+        validate_resume(cfg, output, args.resume)
+        if args.resume:
+            guard_active_containers(output)
+        for gpu in devices:
+            locks.enter_context(exclusive_lock(lock_root / f"p1-baseline-gpu-{gpu}.lock"))
+        check_gpu_devices(devices)
+        stop = multiprocessing.get_context("spawn").Event()
+        previous_signals = {}
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_signals[signum] = signal.signal(signum, lambda number, frame: stop.set())
+        pilot = None
+        try:
+            pilot = Pilot(cfg, output)
+            pilot.stop_event = stop
+            pilot.execute(args.prepare_only)
+            return 130 if stop.is_set() else 0
+        except InterruptedError:
+            path = output / "manifest.json"
+            if path.exists():
+                manifest = json.loads(path.read_text())
+                manifest.update(status="interrupted", updated_at=beijing_now().isoformat(timespec="seconds"))
+                dump(path, manifest)
+            return 130
+        finally:
+            try:
+                if pilot is not None:
+                    pilot.close_model()
+            finally:
+                for signum, handler in previous_signals.items():
+                    signal.signal(signum, handler)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

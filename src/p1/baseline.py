@@ -23,7 +23,7 @@ import sys
 from threading import Event
 
 from .data import ROOT
-from .baseline_state import (
+from .helper.baseline_state import (
     archive_incomplete, atomic_json as dump, atomic_text, beijing_now,
     cleanup_reference_artifacts, completed_reference, exclusive_lock,
     guard_active_containers, guard_legacy_controller,

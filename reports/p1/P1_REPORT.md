@@ -69,8 +69,8 @@ BF16 描述语言模型权重与推理精度，不会将参考计算任务的输
 | `.runtime/conda/learner` | 宿主机上的模型推理与评测控制器 |
 | `.runtime/conda/kernel` | 容器内使用的 Python、PyTorch 和 Ninja；只读挂载 |
 | `/usr/local/cuda-12.9` | CUDA Toolkit 12.9；只读挂载到容器 |
-| GPU 2 | Qwen 模型生成，按编号选择 |
-| GPU 3 | 参考与候选的验证、性能测量，按编号选择 |
+| 默认 GPU 2 | Qwen 模型生成；generation_gpu 可填整数或编号列表 |
+| 默认 GPU 3 | 参考与候选验证、测时；evaluation_gpu 可填整数或编号列表 |
 | `third_party/verl` | 后续训练使用的源码；P1 不调用 |
 
 当前目标为 A100 sm_80，PyTorch 为 2.11+cu129；硬件和软件条件不同于论文的 H20 验证池。
@@ -93,8 +93,8 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 
 | 字段 | 当前值 | 含义及生效方式 |
 |---|---|---|
-| `generation_gpu` | `2` | 宿主机用于 Qwen 生成的 GPU 编号；通过 CUDA_VISIBLE_DEVICES 选择。只暴露一张卡后，进程内部通常将其显示为 cuda:0。 |
-| `evaluation_gpu` | `3` | 参考预检、候选验证与性能测量使用的宿主 GPU 编号，由 Docker 的 --gpus device=编号指定；独立 baseline 入口可用 --gpu 临时覆盖。 |
+| `generation_gpu` | `2` | 宿主机 Qwen 生成卡编号或编号列表，例如 [2,3]；每卡独立完整模型副本、按题并行，非张量并行；各进程内部通常显示为 cuda:0。 |
+| `evaluation_gpu` | `3` | 参考预检、验证及测时的宿主卡编号或列表，例如 [4,5]；整组评测独占其中一张卡。不能与生成卡重合；Docker 按编号选择。独立 baseline 用 --gpu/--gpus 覆盖。 |
 | `context_tokens` | `131072` | Agent 的总上下文窗口，单位 token，同时用于 vLLM 的 max_model_len。提示、累计对话、思考、工具反馈和输出共同占用窗口，不是每轮可新增这么多 token。 |
 | `generation_tokens` | `null` | 单次生成的额外输出上限，单位 token。null 表示只受当前窗口余量限制；设置正整数时，与窗口余量取较小值。 |
 | `tool_feedback_tokens` | `null` | 加入 Agent 对话的单次工具反馈 token 上限。null 表示不额外按 token 截断；工具自身和错误日志仍可能返回有界摘要，原始反馈另存日志。 |
@@ -180,7 +180,7 @@ baseline 入口默认创建带时间戳的独立目录。这里的 `--limit 12` 
 
 ### 7.2 运行 Qwen single/agent pilot
 
-启动脚本会加载 Conda 并激活 learner，无需额外 activate.sh。先确认 GPU 2、3 可用；当前控制器会检查两卡显存占用，超过 100 MiB 时拒绝启动，并要求项目所在文件系统至少有 80 GiB 可用空间。
+启动脚本会加载 Conda 并激活 learner，无需额外 activate.sh。先确认配置指定的所有卡可用（默认生成 2、评测 3）；控制器会逐卡检查显存占用，超过 100 MiB 时拒绝启动，并要求项目所在文件系统至少有 80 GiB 可用空间。
 
 ```bash
 cd /home/likun/junjxu/CUDA-Agent
@@ -577,7 +577,7 @@ bash scripts/p1-baseline.sh --task-id ops6k-00192d5b7124134b --gpu 3 --run runs/
 
 ## 12. 纯基线的断点续跑与多卡执行
 
-本节对应 `src/p1/baseline.py`、`src/p1/baseline_state.py` 的调度与持久化扩展，不修改参考输入、容差、编译方式或测时轮数，不启动 Qwen/Agent。未自动停止、恢复或重跑已有实验，也未修改旧运行的中间结果。
+本节对应 `src/p1/baseline.py`、`src/p1/helper/baseline_state.py` 的调度与持久化扩展，不修改参考输入、容差、编译方式或测时轮数，不启动 Qwen/Agent。未自动停止、恢复或重跑已有实验，也未修改旧运行的中间结果。
 
 ### 12.1 怎么运行
 
@@ -640,7 +640,7 @@ SIGKILL、关机或容器故障不保证当前题完成；下次恢复会归档�
 
 58 项 CPU 回归全部通过，覆盖：双卡确实同时处理不同题且同卡串行、停止后收齐当前题、续跑跳过成功与拒绝题、损坏汇总重建、半成品归档、旧格式 manifest 恢复、配置/数据/协议漂移拒绝、目录/卡号锁、原子替换失败保护、共享配置与独立卡号、续跑保留原文件名、SIGTERM 收尾及遗留容器识别。使用假评测器、临时目录和模拟 Docker 返回值；没有运行真实多卡 GPU 测时，真实环境下的吞吐收益尚未测量。
 
-本次配置共享改动只影响宿主配置传递和锁位置，不修改 worker 的数值与测时逻辑。上一版按卡拆配置的评测器代码指纹到当前版本有明确的兼容映射，续跑时更新 manifest 内容；未知评测器改动、worker 或 contract 指纹变化仍会拒绝。旧运行的现有文件不迁移、不改名；参考预检、测时结果以及三种汇总的文件名保持原样。
+本次配置共享改动只影响宿主配置传递和锁位置，不修改 worker 的数值与测时逻辑。此前配置共享及本次 helper 导入路径调整的评测器代码指纹，均有明确的兼容映射，续跑时更新 manifest 内容；未知评测器改动、worker 或 contract 指纹变化仍会拒绝。旧运行的现有文件不迁移、不改名；参考预检、测时结果以及三种汇总的文件名保持原样。
 
 ### 12.6 每题完成后的参数与缓存清理
 
@@ -653,10 +653,104 @@ Qwen pilot 的 single、agent 共用同一份参考参数，因此须等同一�
 最终隐藏验收结束、完整轨迹结果和根摘要保存后再清理。single 已完成但 agent 中断时
 保留参数和缓存；仅 `--prepare-only` 时保留有效题参数，预检拒绝题保存拒绝结果后清理。
 
-清理由 `baseline_state.cleanup_reference_artifacts()` 统一实施：先核对目标位于本题
+清理由 `helper.baseline_state.cleanup_reference_artifacts()` 统一实施：先核对目标位于本题
 目录，拒绝路径逃逸、目录符号链接及错误文件类型，再删除两个明确目标。
 不删除源码、`preflight.json`、`prepare_result.json`、`bench_result.json`、日志、
 轨迹、候选源码和根汇总，不新增逐题清理 JSON。续跑识别依赖保留的阶段详情，
 参数目录不存在不意味着完成结果失效；同题若需重新测量或候选验收，应新建运行重建参数。
 
 该清理只影响结果保存后的磁盘占用，不改变输入种子、正确性判定、性能测量或 GPU 预算。
+
+
+## 13. p1-run.sh 的文件、模块与整体调用关系
+
+这条入口评估 **Qwen 原生生成 CUDA 的能力**，包括 single 和多轮 agent；它与第 11、12 节只测 eager/torch.compile 的 `p1-baseline.sh` 是两个入口。下表路径均相对 `/home/likun/junjxu/CUDA-Agent`；建议先看前四行，再顺着工具与评测调用向下读。通用持久化与多卡调度集中放在 `src/p1/helper/`，主流程通过包内导入使用。
+
+### 13.1 从配置到最终结果
+
+```text
+scripts/p1-run.sh → src/p1/run.py:main
+  ├─ configs/p1-pilot.json：模型、生成预算、工具/测时参数、两组卡号
+  ├─ data/processed/pilot.json → run/tasks.json：首次固定 train pilot；续跑用原题单
+  └─ Pilot.execute
+      ├─ 参考预检：Evaluator.prepare → Docker → worker.py
+      ├─ 每题 single → agent；两者分别生成、评测、隐藏验收
+      │   ├─ Pilot.model/generate → learner Conda 中的 vLLM/Qwen
+      │   ├─ 文件工具 → tools.py
+      │   ├─ SHELL → sandbox.py → agent_utils → RPC 回到宿主评测器
+      │   └─ compile/verify/profile → evaluation.py → Docker → worker.py
+      ├─ 每条完整轨迹保存 → 父控制器更新 results.json
+      └─ 同题两种模式结束后清参数/缓存 → 全部结束写 summary.json
+```
+
+多卡时，`Pilot.execute` 交给 `pilot_parallel.py` 调度：父进程预检并派题，生成子进程各加载一个 Qwen；工具、合同、候选评测和数值协议仍调用同一套代码。
+
+| 文件/目录 | 内部主要模块或入口 | 作用及为什么需要 |
+|---|---|---|
+| `scripts/p1-run.sh`、`scripts/set-env.sh` | Shell 环境设置、`exec python -m p1.run` | 定位项目、激活 learner、配置 CUDA/缓存/模块路径，再把命令行参数交给 Python；父进程不固定占用 GPU 2。 |
+| `configs/p1-pilot.json` | 模型、生成、评测、数据及 GPU 配置字段 | 本次运行的统一参数来源；运行开始复制到 manifest 与公共 worker 配置，便于回溯。字段解释见第 4 节。 |
+| `src/p1/data.py`、`data/processed/pilot.json` | 数据整理、8:2 分组划分、train pilot 抽取、`ROOT/sha` | 数据准备阶段产出固定 pilot。p1-run **读取已有 pilot，不重新划分数据**；run/tasks.json 固定本次题目与顺序。 |
+| `src/p1/run.py` | `main/validate_resume/check_gpu_devices` | 参数解析、只读预览、配置一致性、GPU 占用及目录/卡号锁，防止误覆盖和同项目抢卡。 |
+| 同上 | `Pilot.model/generate/prompt`、`generation_budget/parse` | 加载本地 BF16 Qwen；构造合同、官方 SKILL 和工具描述；控制上下文/输出预算，解析模型工具调用。 |
+| 同上 | `trajectory/_trajectory/select_candidate` | 管理每题 single/agent 的工作区、生成与工具循环；从历史候选选择可验收结果，执行最终隐藏验收。single 不进行反馈迭代，agent 多轮使用反馈修正源码。 |
+| 同上 | `make_manifest/save_result_summaries/finish_summary` | 保存配置、源码指纹、逐轨迹摘要和最终正确率/加速比/成本；根摘要链接完整轨迹，避免复制全部日志。 |
+| `src/p1/helper/pilot_parallel.py` | `gpu_numbers/gpu_roles`、`EvaluationPool` | 解析单卡或列表；生成/评测卡分离；评测操作排队租卡，防止不同题同时在同卡测时。 |
+| 同上 | `ParallelEvaluator`、`generation_worker/run_generation_workers/execute_parallel` | 在原评测器外增加整组卡锁与全局快照编号锁；spawn 独立模型副本、派发整题、收集完成/错误事件；只有父进程写根汇总。 |
+| `src/p1/tools.py` | `TOOLS/schema`、`WorkspaceTools.path/write/dispatch` | 将读写文件、SHELL、编译/验证/分析等工具暴露给模型，限制文件写入范围，并转交实际动作。 |
+| `src/p1/sandbox.py` | `BashProcess`、`SandboxSession` | 为一条 Agent 轨迹保留完整 Bash 会话状态；Shell 在无 GPU 容器中执行，GPU 请求通过受控 RPC 交回宿主。 |
+| `src/p1/agent_utils/` | `client.py`、`compile.py/compile.sh`、`verification.py`、`profiling.py` | 挂载到 Agent 的 `/workspace/utils`，接收命令行参数并请求宿主编译、正确性检查及性能分析；不是另一套判分代码。 |
+| `src/p1/evaluation.py` | `prepare/profile_reference`、`snapshot/compile_only` | 准备可信参考参数及起始性能，冻结候选源码、检查固定绑定并独立编译；候选自带 .so 不作为可信产物。 |
+| 同上 | `container/streamed_checks/evaluate`、`compare/reward` | 调度隔离容器，外部比较参考/候选数值；编译、正确性、前后基线与候选测时、漂移/状态审核及里程碑奖励在此串联。 |
+| `src/p1/worker.py` | `settings/prepare/compile_candidate/runtime_fallbacks`；`timing/bench/profile_model/stream/main` | 容器内实际执行参数保存、CUDA 扩展编译、模型运行、CUDA event 测时、profiler 采样和输出流；宿主控制器读取结果后独立判定。 |
+| `src/p1/contract.py` | `audit_contract`、`contract` | 候选静态合同审核，区分明确违规与待复核提示；与 worker 的运行时限制配合使用。 |
+| `src/p1/helper/baseline_state.py` | `atomic_json`、锁、`cleanup_reference_artifacts`、归档与北京时间 | 复用安全写盘和锁；同题两模式保存后只删 input-spec 与 compile-cache，保留源码、阶段证据及完整轨迹。 |
+| `upstream/CUDA-Agent/agent_workdir/` | `SKILL.md`、`binding.cpp`、`binding_registry.h` | 提供官方开发约定和固定绑定；本地 Agent 工具是受控环境的适配实现，并不直接运行整套上游 utils。 |
+| `models/Qwen3.5-9B`、`.runtime/conda/{learner,kernel}`、现有 Docker 镜像 | 本地权重/tokenizer、推理/执行依赖、隔离执行环境 | learner 在宿主生成；kernel Conda、CUDA 工具链等挂载给 Docker 中的 worker。镜像提供隔离进程环境；无需每题创建新镜像。 |
+| `src/p1/status.py`、`tests/p1/` | 只读状态汇总、CPU 回归与独立 smoke 脚本 | status 读取落盘进度；tests 检查协议、调度、续跑与清理行为，不参与正式判分。 |
+
+### 13.2 哪些输出值得优先看
+
+| 输出（相对于 run） | 主要内容 |
+|---|---|
+| `manifest.json`、`tasks.json`、`worker-config.json` | 本次配置/源码身份/状态、固定题单、所有卡共享的唯一 worker 配置；多卡清单另见 manifest.execution。 |
+| `references/<id>/` | 原模型、预检状态索引、参数准备与起始测时详情/日志；参数和编译缓存按题结束清理，状态与测时证据保留。 |
+| `trajectories/<id>/{single,agent}/` | 开发工作区、逐轮模型原文、工具反馈、事件与完整 result.json；正确性结论以最终隐藏验收为准。 |
+| `evaluations/<数字编号>/` | 每次提交的源码快照、编译与正确性证据、原始计时/日志；多进程共享递增编号，目录不按卡另分。 |
+| `results.json`、`summary.json` | 每完成一条轨迹更新摘要/详情路径；整体结束再统计两模式正确率、有效加速比和成本。pilot 不生成纯 baseline 的 CSV/REPORT.md。 |
+| `interrupted/` | 续跑前归档没有最终结果的轨迹或不完整参考目录，保留中断证据。 |
+
+### 13.3 多卡配置与运行方式
+
+`generation_gpu` 和 `evaluation_gpu` 都支持整数或非空、无重复的非负整数列表。仓库默认仍为 `2` 和 `3`。下面只展示需要编辑的两个 JSON 字段；示例卡号须自行确认可用，两组不能重合：
+
+```json
+{
+  "generation_gpu": [2, 3],
+  "evaluation_gpu": [4, 5]
+}
+```
+
+生成采用**每卡一个完整 Qwen 副本，不同题并行**，每道题仍依次执行 single、agent；不是把一个模型拆到多卡。一张生成卡空闲就领取下一题，固定题目索引和生成种子不随派发顺序变化。每个副本保留原来的上下文、采样与工具预算，不通过改变实验参数来提速。
+
+评测池一次租出一张卡给**完整作业**：例如一次 evaluate 的编译、参考/候选正确性检查、前后参考及候选测时均固定该卡；原正确性检查内部的两个流式容器仍可同时工作。嵌套调用和重试复用租约，不会各抢一张卡。参考预检按评测卡数并行。仅增加评测卡时，单模型的工具调用仍然顺序发生，吞吐提升主要来自预检；想并行生成不同题，需同时增加生成卡。
+
+```bash
+# 切换到服务器项目。
+cd /home/likun/junjxu/CUDA-Agent
+# 编辑两个 GPU 字段后，先预览；Python 不查询/启动 GPU，不创建 run。
+bash scripts/p1-run.sh --run runs/p1/pilot-multi --dry-run
+# 由你确认资源后，实际启动新的模型 pilot。
+bash scripts/p1-run.sh --run runs/p1/pilot-multi
+# 恢复原目录；允许更换两组卡号，其余配置必须一致。
+bash scripts/p1-run.sh --run runs/p1/pilot-multi --resume
+```
+
+多卡只保留一份 `worker-config.json`，不产生 `worker-config-gpu-*.json`。父进程在启动线程/子进程前写公共配置，各评测器只读复用；实际评测卡通过宿主属性传给 Docker，阶段结果记录 `evaluation_gpu`，轨迹结果记录 `generation_gpu`。根摘要按原题单和 single/agent 顺序排序，不按完成先后排列。
+
+续跑沿用 run/tasks.json，已存在且身份匹配的最终轨迹直接复用；未完成轨迹归档后从头重做，**不恢复半轮 token/KV cache**。同题 single 完成、agent 未完成时，保留参考参数。两种模式都已完成的题即使参数已清理，也不会为恢复统计而重新加载模型。损坏的最终轨迹结果会报错，不能静默覆盖。
+
+Ctrl+C/SIGTERM 请求停止后，不再领取新题；生成或容器当前调用会先返回，再在安全边界退出，已保存结果保留。停止不是立刻释放所有 GPU。文件锁同时保护 run 与同项目卡号，并与新版 p1-baseline 共用卡锁；无法阻止其他项目抢卡。异常子进程退出会使运行失败并保留完成结果，不自动重启实验。
+
+`summary.generation_gpu_reserved_seconds/hours` 在多卡时为各模型副本保留时长之和，含等待评测的时间，是 GPU 秒/小时，**不是整次墙钟耗时**。generation_workers 分列本次各卡成本；container_seconds 是容器耗时之和。恢复调用的模型/容器成本只统计本次调用，逐轨迹 token 成本从所有已完成结果汇总；中断轨迹的额外成本仍需查 interrupted 证据，不能视为零。
+
+多模型副本和并行编译会增加显存、CPU、系统内存及磁盘压力；跨卡频率/温度也影响计时，建议使用同型号、无外部负载的卡。此次验证使用 CPU 假模型/假容器与真实 spawn 子进程，未执行真实多卡生成或测时，因此尚无实际加速倍数结论。

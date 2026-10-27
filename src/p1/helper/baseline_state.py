@@ -1,4 +1,4 @@
-"""P1 纯基线的持久化、运行锁及已完成阶段识别；只使用标准库，不启动 GPU。
+"""P1 基线与 pilot 的持久化、运行锁及已完成阶段识别；只使用标准库，不启动 GPU。
 
 调用：由 p1.baseline 和评测控制器导入，不单独执行。
 输入：运行目录、固定题目和阶段 JSON；输出：原子写盘、锁和可恢复的阶段结果。
@@ -103,14 +103,17 @@ def protocol_fingerprints(source):
 
 
 def protocol_matches(recorded, current):
-    """输入原/当前协议指纹；仅允许本次已审查的配置共享改动，不放行其他评测变化。
+    """输入原/当前协议指纹；仅兼容已审查的配置共享和辅助模块路径调整。
 
-    该改动只调整配置文件和宿主卡号传递，不修改 worker 的数值、容差、测时算法。
+    兼容改动仅涉及配置传递和辅助模块导入路径，不修改数值、容差或测时算法。
     旧版多卡 run 可继续使用；worker/contract 指纹仍须完全一致，未知修改仍拒绝。
     """
     compatible = {
+        # 历史配置共享版本和本次移动前版本，均只放行到当前精确源码指纹。
         "2afbf8ca1dd5c643fbddadcd21be7f9db89c9731556e63e3162a57874e29ff3b":
-        "10d655b9bfa9ef16844c4dd4aaaea0ad24e65207244d6104b644cd2c8802081d",
+        "52ba32e10c4f7b74bf2c918837960a700ee2eb175c12475a20f84697a33d874e",
+        "10d655b9bfa9ef16844c4dd4aaaea0ad24e65207244d6104b644cd2c8802081d":
+        "52ba32e10c4f7b74bf2c918837960a700ee2eb175c12475a20f84697a33d874e",
     }
     if recorded == current:
         return True
