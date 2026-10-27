@@ -696,6 +696,7 @@ scripts/p1-run.sh → src/p1/run.py:main
 | 同上 | `make_manifest/save_result_summaries/finish_summary` | 保存配置、源码指纹、逐轨迹摘要和最终正确率/加速比/成本；根摘要链接完整轨迹，避免复制全部日志。 |
 | `src/p1/helper/pilot_parallel.py` | `gpu_numbers/gpu_roles`、`EvaluationPool` | 解析单卡或列表；生成/评测卡分离；评测操作排队租卡，防止不同题同时在同卡测时。 |
 | 同上 | `ParallelEvaluator`、`generation_worker/run_generation_workers/execute_parallel` | 在原评测器外增加整组卡锁与全局快照编号锁；spawn 独立模型副本、派发整题、收集完成/错误事件；只有父进程写根汇总。 |
+| `src/p1/helper/progress.py` | `PilotProgress` | 主控制器显示参考预检及两模式 tqdm 进度，统计已完成结果的 pass_rate 与有效加速比几何均值，续跑恢复已有计数。 |
 | `src/p1/tools.py` | `TOOLS/schema`、`WorkspaceTools.path/write/dispatch` | 将读写文件、SHELL、编译/验证/分析等工具暴露给模型，限制文件写入范围，并转交实际动作。 |
 | `src/p1/sandbox.py` | `BashProcess`、`SandboxSession` | 为一条 Agent 轨迹保留完整 Bash 会话状态；Shell 在无 GPU 容器中执行，GPU 请求通过受控 RPC 交回宿主。 |
 | `src/p1/agent_utils/` | `client.py`、`compile.py/compile.sh`、`verification.py`、`profiling.py` | 挂载到 Agent 的 `/workspace/utils`，接收命令行参数并请求宿主编译、正确性检查及性能分析；不是另一套判分代码。 |
@@ -754,3 +755,22 @@ Ctrl+C/SIGTERM 请求停止后，不再领取新题；生成或容器当前调�
 `summary.generation_gpu_reserved_seconds/hours` 在多卡时为各模型副本保留时长之和，含等待评测的时间，是 GPU 秒/小时，**不是整次墙钟耗时**。generation_workers 分列本次各卡成本；container_seconds 是容器耗时之和。恢复调用的模型/容器成本只统计本次调用，逐轨迹 token 成本从所有已完成结果汇总；中断轨迹的额外成本仍需查 interrupted 证据，不能视为零。
 
 多模型副本和并行编译会增加显存、CPU、系统内存及磁盘压力；跨卡频率/温度也影响计时，建议使用同型号、无外部负载的卡。此次验证使用 CPU 假模型/假容器与真实 spawn 子进程，未执行真实多卡生成或测时，因此尚无实际加速倍数结论。
+
+
+### 13.4 终端进度与实时指标
+
+`p1-run.sh` 在交互终端显示参考预检进度，随后分别显示 single、agent 的 tqdm 进度条。每种模式的总数是通过参考预检的题数，预检拒绝题不进入模型轨迹进度。多卡只由父进程更新；续跑会在加载模型前恢复已有完成数，避免重复计数。
+
+- `pass_rate=75.0%(3/4)`：当前该模式 4 道题已完成，其中 3 道最终 `correct=true`。分母只包含已完成题，不将未完成题当作失败；完整运行结束后与 `pass_rate_on_reference_valid` 对应。
+- `speedup_eager`、`speedup_compile`：分别统计当前模式已完成、正确且测时有效的候选加速比**几何均值**，与最终 summary 的 GM 口径一致；`valid` 是参与统计的题数。失败、无效或缺失值不补零，没有有效值时显示 `--`。
+- 每条新轨迹完成且根结果写盘后，用 `tqdm.write` 另行打印该题的 `correct`、`speedup_eager`、`speedup_compile`，以及该模式当前累计 `pass_rate`；进度条是累计统计，逐题 RESULT 日志是该题自身指标。
+- 更新以整条 single/agent 轨迹及最终验收结束为准，不把开发中临时通过的候选当作最终成功题。日志重定向等非交互输出关闭动态条，仍保留逐题结果行。
+
+示意显示（不是实测结果）：
+
+```text
+single ... 4/12 ... pass_rate=75.0%(3/4) speedup_eager=1.25x speedup_compile=0.98x valid=3(GM)
+agent  ... 3/12 ... pass_rate=66.7%(2/3) speedup_eager=1.60x speedup_compile=1.20x valid=2(GM)
+```
+
+进度仅用于终端展示，不新增结果文件、不改变实验配置或结果汇总。正常结束、停止或异常退出都会关闭进度条。

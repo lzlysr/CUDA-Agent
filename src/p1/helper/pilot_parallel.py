@@ -354,6 +354,9 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
     records = {}
     indices = {task["task_id"]: index for index, task in enumerate(tasks)}
     eligible = []
+    progress = getattr(pilot, "progress", None)
+    if progress is not None:
+        progress.start_references(tasks)
     evaluators = []
     local = threading.local()
 
@@ -402,6 +405,8 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
                         "task_id": task["task_id"], "mode": "reference", "status": "task_invalid",
                     }
                 persist()
+                if progress is not None:
+                    progress.reference_done(task["task_id"], preflight["status"])
                 if preflight["status"] != "ok":
                     cleanup_reference_artifacts(pilot.run, task["task_id"])
         eligible.sort(key=lambda task: indices[task["task_id"]])
@@ -409,6 +414,8 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
             manifest.update(status="prepared", updated_at=beijing_now().isoformat(timespec="seconds"))
             atomic_json(pilot.run / "manifest.json", manifest)
             return
+        if progress is not None:
+            progress.start_modes(eligible, pilot.results)
         pending = []
         for index, task in enumerate(eligible):
             if all((task["task_id"], mode) in records for mode in MODES):

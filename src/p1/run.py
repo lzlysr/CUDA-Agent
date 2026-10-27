@@ -24,6 +24,7 @@ from .helper.baseline_state import (
     atomic_json as dump, beijing_now, cleanup_reference_artifacts, exclusive_lock, run_lock_path, guard_active_containers,
 )
 from .helper.pilot_parallel import gpu_roles
+from .helper.progress import PilotProgress
 from .evaluation import Evaluator, InfrastructureError
 
 from .tools import TOOLS, WorkspaceTools
@@ -126,6 +127,7 @@ class Pilot:
         self.session = None
         self._search_evals = []
         self.stop_event = None
+        self.progress = None
 
     def model(self):
         """无参数；在本进程指定编号卡加载完整 BF16 模型及 tokenizer，返回 None。"""
@@ -529,6 +531,10 @@ class Pilot:
             row["detail_path"] = detail.relative_to(self.run).as_posix()
             rows.append(row)
         dump(self.run / "results.json", rows)
+        # 结果原子落盘后再推进显示；子进程不创建进度条，也不写根汇总。
+        progress = getattr(self, "progress", None)
+        if progress is not None:
+            progress.sync(self.results)
 
     def make_manifest(self, tasks):
         """输入固定题单；返回配置、源码指纹和北京时间运行清单，不加载模型。"""
@@ -611,10 +617,22 @@ class Pilot:
             finished_at=beijing_now().isoformat(timespec="seconds")
         )
         dump(self.run / "manifest.json", manifest)
+        progress = getattr(self, "progress", None)
+        if progress is not None:
+            progress.close()
         print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
     def execute(self, prepare_only=False):
-        """输入是否仅预检；保存运行题单、评测两种模式并汇总，返回 None；不自动扩展数据集。"""
+        """输入是否仅预检；主控制器显示进度，并在正常结束或异常退出时关闭进度条。"""
+        self.progress = PilotProgress()
+        try:
+            return self._execute(prepare_only)
+        finally:
+            self.progress.close()
+            self.progress = None
+
+    def _execute(self, prepare_only=False):
+        """输入是否仅预检；保存题单、评测两种模式并汇总，不改变原有数据和预算。"""
         generation, evaluation = gpu_roles(self.cfg)
         if len(generation) > 1 or len(evaluation) > 1:
             from .helper.pilot_parallel import execute_parallel
@@ -627,6 +645,7 @@ class Pilot:
         manifest = self.make_manifest(tasks)
         dump(self.run / "manifest.json", manifest)
         eligible = []
+        self.progress.start_references(tasks)
         for task in tasks:
             if self.stop_event is not None and self.stop_event.is_set():
                 raise InterruptedError("停止参考预检")
@@ -644,7 +663,7 @@ class Pilot:
                         "detail_path": dest.relative_to(self.run).as_posix(),
                     }
                 )
-            print("PREFLIGHT", task["task_id"], pre["status"], flush=True)
+            self.progress.reference_done(task["task_id"], pre["status"])
         # 预检失败也在根目录保留逐题摘要，仅准备模式不丢失状态记录。
         self.save_result_summaries()
         # 预检拒绝的题不会进入 single/agent；状态保存后即可释放其参数和缓存。
@@ -655,6 +674,15 @@ class Pilot:
             manifest.update(status="prepared", updated_at=beijing_now().isoformat(timespec="seconds"))
             dump(self.run / "manifest.json", manifest)
             return
+        # 只读已有最终轨迹，续跑时先恢复进度与统计，再等待模型加载。
+        completed = []
+        for task in eligible:
+            for mode in ("single", "agent"):
+                result_path = self.run / "trajectories" / task["task_id"] / mode / "result.json"
+                if result_path.exists():
+                    completed.append(json.loads(result_path.read_text()))
+        self.progress.start_modes(eligible, completed)
+        del completed
         needs_model = any(
             not (self.run / "trajectories" / task["task_id"] / mode / "result.json").exists()
             for task in eligible for mode in ("single", "agent")
@@ -669,13 +697,10 @@ class Pilot:
                 if dest.exists():
                     res = json.loads(dest.read_text())
                 else:
-                    print("START", task["task_id"], mode, flush=True)
+                    self.progress.write("START", task["task_id"], mode)
                     res = self.trajectory(task, mode, index)
                 self.results.append(res)
                 self.save_result_summaries()
-                print(
-                    "RESULT", task["task_id"], mode, res["correct"], res["termination"], flush=True
-                )
             # single 和 agent 共用参数，须等两条轨迹及隐藏验收结束且摘要保存后再清理。
             # 轨迹中断或仅 --prepare-only 时不会到这里，保留后续运行需要的参数。
             cleanup_reference_artifacts(self.run, task["task_id"])
