@@ -1,6 +1,6 @@
 # P1 基线：当前方案与运行说明
 
-更新日期：2026-10-26。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
+更新日期：2026-10-28。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
 
 本文整合当前的数据、模型、工具、评测协议及运行方法。模型正确率、加速比和成本等实际结果，以接下来新建运行目录中的输出为准。
 
@@ -69,8 +69,8 @@ BF16 描述语言模型权重与推理精度，不会将参考计算任务的输
 | `.runtime/conda/learner` | 宿主机上的模型推理与评测控制器 |
 | `.runtime/conda/kernel` | 容器内使用的 Python、PyTorch 和 Ninja；只读挂载 |
 | `/usr/local/cuda-12.9` | CUDA Toolkit 12.9；只读挂载到容器 |
-| 默认 GPU 2 | Qwen 模型生成；generation_gpu 可填整数或编号列表 |
-| 默认 GPU 3 | 参考与候选验证、测时；evaluation_gpu 可填整数或编号列表 |
+| 当前配置 GPU [4,5] | Qwen 模型生成；generation_gpu 可填整数或编号列表 |
+| 当前配置 GPU [6,7] | 参考与候选验证、测时；evaluation_gpu 可填整数或编号列表 |
 | `third_party/verl` | 后续训练使用的源码；P1 不调用 |
 
 当前目标为 A100 sm_80，PyTorch 为 2.11+cu129；硬件和软件条件不同于论文的 H20 验证池。
@@ -93,8 +93,8 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 
 | 字段 | 当前值 | 含义及生效方式 |
 |---|---|---|
-| `generation_gpu` | `2` | 宿主机 Qwen 生成卡编号或编号列表，例如 [2,3]；每卡独立完整模型副本、按题并行，非张量并行；各进程内部通常显示为 cuda:0。 |
-| `evaluation_gpu` | `3` | 参考预检、验证及测时的宿主卡编号或列表，例如 [4,5]；整组评测独占其中一张卡。不能与生成卡重合；Docker 按编号选择。独立 baseline 用 --gpu/--gpus 覆盖。 |
+| `generation_gpu` | `[4,5]` | 宿主机 Qwen 生成卡编号或编号列表，例如 [2,3]；每卡独立完整模型副本、按题并行，非张量并行；各进程内部通常显示为 cuda:0。 |
+| `evaluation_gpu` | `[6,7]` | 参考预检、验证及测时的宿主卡编号或列表，例如 [4,5]；整组评测独占其中一张卡。不能与生成卡重合；Docker 按编号选择。独立 baseline 用 --gpu/--gpus 覆盖。 |
 | `context_tokens` | `131072` | Agent 的总上下文窗口，单位 token，同时用于 vLLM 的 max_model_len。提示、累计对话、思考、工具反馈和输出共同占用窗口，不是每轮可新增这么多 token。 |
 | `generation_tokens` | `null` | 单次生成的额外输出上限，单位 token。null 表示只受当前窗口余量限制；设置正整数时，与窗口余量取较小值。 |
 | `tool_feedback_tokens` | `null` | 加入 Agent 对话的单次工具反馈 token 上限。null 表示不额外按 token 截断；工具自身和错误日志仍可能返回有界摘要，原始反馈另存日志。 |
@@ -116,7 +116,7 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 
 `thinking` 在生成代码中固定开启，不是当前 JSON 的可配置字段。single/Agent 的窗口值借用论文披露的设置；temperature/top_p 仍是本地参数，不能视为论文同条件复刻。
 
-128K 配置和 tokenizer 已在 CPU 核对；新版模型流程的 128K GPU 验通及真实性能仍待实际运行确认。
+2026-10-27 至 28 日的真实 pilot 已执行多卡及长上下文流程，并出现上下文预算耗尽的轨迹；这证明流程实际运行过，不表示模型已经产出通过验收的 kernel。该轮结果和本次修复验证的边界见第 14 节。
 
 ## 5. 从输入到结果的流程
 
@@ -221,7 +221,7 @@ PYTHONPATH=src python -B -m p1.status --run runs/p1/pilot-train-v3-seed42
 |---|---|---|
 | 基座模型 | Seed1.6，230B 总参数/23B 激活参数 | 用户指定 Qwen3.5-9B，架构和规模不同 |
 | 单轮窗口 | 单轮 RL 为 32768 | single 使用该窗口数字，不声称论文披露了相同的单轮推理输出上限 |
-| Agent 窗口 / turn 上限 | 131072 / 200 | 配置相同，128K GPU 运行仍待确认 |
+| Agent 窗口 / turn 上限 | 131072 / 200 | 窗口/turn 配置相同；真实流程已运行，模型与训练条件仍不同 |
 | 单次 4096 token、整条 30 分钟 | 未找到足以复刻的明确依据 | 不设置这两个额外默认上限；保留单次操作超时 |
 | temperature/top_p | 未找到足以完全复刻的数值 | 本地使用 0.7/0.95 |
 | 开发工具 | 持久 Bash、文件工具、SKILL 等 | 提供对应 CUDA 任务工具和 utils 兼容命令；不等同于完整 OpenHands 系统 |
@@ -429,7 +429,7 @@ GPU 检查通过后，`run_baselines()` 新建输出目录。默认形如 `runs/
 
 1. 加载 `/reference/model.py`，从中取得 Model、get_init_inputs、get_inputs。
 2. 分别使用初始化种子 71001、73001、73002，同步 Python、NumPy、PyTorch 和 CUDA 随机源。
-3. 每个种子下构造 `Model(*get_init_inputs()).eval().cuda()`，保存初始化参数和 state_dict。无可训练参数的任务可以有空 state_dict，这不代表任务不合法。
+3. 每个种子下构造 `Model(*get_init_inputs()).eval().cuda()`，仅保存 CPU state_dict；后续按同一初始化种子，从只读参考模块的 get_init_inputs() 重建构造参数，再严格加载权重。无可训练参数的任务可以有空 state_dict，这不代表任务不合法。
 4. 对输入种子 72000、72001 分别生成输入，把同一输入复制后执行两次参考程序，检查重复结果一致及浮点输出有限值。
 5. 采样输出元素并记录 shape/dtype/numel 等统计，检查不同输入及初始化下是否都近似同一个常数。
 
@@ -696,6 +696,7 @@ scripts/p1-run.sh → src/p1/run.py:main
 | 同上 | `make_manifest/save_result_summaries/finish_summary` | 保存配置、源码指纹、逐轨迹摘要和最终正确率/加速比/成本；根摘要链接完整轨迹，避免复制全部日志。 |
 | `src/p1/helper/pilot_parallel.py` | `gpu_numbers/gpu_roles`、`EvaluationPool` | 解析单卡或列表；生成/评测卡分离；评测操作排队租卡，防止不同题同时在同卡测时。 |
 | 同上 | `ParallelEvaluator`、`generation_worker/run_generation_workers/execute_parallel` | 在原评测器外增加整组卡锁与全局快照编号锁；spawn 独立模型副本、派发整题、收集完成/错误事件；只有父进程写根汇总。 |
+| `src/p1/helper/turn_log.py` | `TurnLog`、`turn_counts` | 原子保存一轮模型原文、生成统计、工具调用和返回；状态查询兼容旧的分离日志，不迁移历史文件。 |
 | `src/p1/helper/progress.py` | `PilotProgress` | 主控制器显示参考预检及两模式 tqdm 进度，统计已完成结果的 pass_rate 与有效加速比几何均值，续跑恢复已有计数。 |
 | `src/p1/tools.py` | `TOOLS/schema`、`WorkspaceTools.path/write/dispatch` | 将读写文件、SHELL、编译/验证/分析等工具暴露给模型，限制文件写入范围，并转交实际动作。 |
 | `src/p1/sandbox.py` | `BashProcess`、`SandboxSession` | 为一条 Agent 轨迹保留完整 Bash 会话状态；Shell 在无 GPU 容器中执行，GPU 请求通过受控 RPC 交回宿主。 |
@@ -722,7 +723,7 @@ scripts/p1-run.sh → src/p1/run.py:main
 
 ### 13.3 多卡配置与运行方式
 
-`generation_gpu` 和 `evaluation_gpu` 都支持整数或非空、无重复的非负整数列表。仓库默认仍为 `2` 和 `3`。下面只展示需要编辑的两个 JSON 字段；示例卡号须自行确认可用，两组不能重合：
+`generation_gpu` 和 `evaluation_gpu` 都支持整数或非空、无重复的非负整数列表。当前配置分别为 `[4,5]` 和 `[6,7]`，应以实际配置文件为准。下面只展示需要编辑的两个 JSON 字段；示例卡号须自行确认可用，两组不能重合：
 
 ```json
 {
@@ -774,3 +775,68 @@ agent  ... 3/12 ... pass_rate=66.7%(2/3) speedup_eager=1.60x speedup_compile=1.2
 ```
 
 进度仅用于终端展示，不新增结果文件、不改变实验配置或结果汇总。正常结束、停止或异常退出都会关闭进度条。
+
+
+## 14. 2026-10-28 问题修复、逐轮日志与验证边界
+
+本节对应服务器当前源码。此前 `run-pilot-12` 的数据、轨迹、源码和结果保持原样；本次未重跑整组 pilot、未运行 CPU 回归，也未将手工修改的诊断候选计入 Qwen 正确率。`P1_ALIGNMENT_AUDIT.md` 是此前的审计快照，其中已修复的问题应结合本节阅读。
+
+### 14.1 已定位的问题与修复
+
+| 问题 | 当前处理 | 未改变的条件 |
+|---|---|---|
+| kernel 环境缺少 transformers，导致 BROS 参考程序无法导入 | 补充与 learner 一致的 transformers 5.9.0 等依赖；版本及 kernel 用途统一记录在 `reports/p0/requirements.txt`，不再单独维护 P1 依赖文件。安装前用既有包版本作约束，安装后比对：原 34 个包版本均未改变，新增 22 个包及传递依赖。 | 未替换 torch、CUDA、cuDNN、cuBLAS、Triton；未改包源码或镜像。 |
+| BROS 的构造参数包含 BrosConfig，直接存进快照后无法用 weights_only=True 加载 | 快照仅存权重；从只读参考 get_init_inputs() 按原种子重建构造参数，候选仍 strict=True 加载同一 state_dict。 | 保持 weights_only=True，不放开任意 Python 对象反序列化，不由候选决定测试参数。 |
+| TypeError 工具反馈只取错误末尾，完整张量打印挤掉绑定函数签名 | 增加 `summarize_error()`：优先保留支持的函数签名、关键字和首个编译错误，省略无助于定位的长张量实参；阶段详情保留原始错误。附带绑定、state_dict、形状、内存越界等针对性提示。 | 没有替模型修改正式候选；提示是本地工程诊断，不是论文原文。 |
+| 根目录绑定头文件使用不同 include 写法时找不到 | 编译头文件搜索路径同时包含候选根目录及 kernels 目录。 | 固定绑定文件不可改，仍使用原 CUDA 编译与运行限制。 |
+| 参考程序缺依赖被记成“任务无效” | worker 标记 `failure_kind=missing_dependency`；控制器保存 `infrastructure_error` 索引后明确报错停止。恢复时仅复用 ok/task_invalid 终态；基础设施故障或不完整参考目录先归档后重做。 | 不把环境错误计入数据拒绝；没有默默减少题目数量。 |
+| 参考重复输出错误不清楚发生在哪 | 保存输出树路径、初始化/输入种子、dtype、shape 和差异；形状与数值比较也给出具体错误。 | 不放宽容差、不改非有限值、近常数和确定性规则。 |
+| 逐轮原文和工具结果分散 | 新运行统一写 turn-XXX.json；非法格式、提交和中断也保留当前轮。 | 不迁移旧结果；messages.json 仍保存完整会话，最终评测仍在 evaluations 下。 |
+
+`write_files()` 现在先验证所有文件路径和内容，再开始写入，避免一次非法提交留下半套源码。single/agent 提示补充严格权重兼容、绑定位置参数、cuDNN 类型化枚举和边界检查等具体约定；明确本机为 sm80，CPU Shell 中通过本地 utils 请求 GPU。模型、数据、采样参数、上下文/turn 预算、计时和验收阈值未改。
+
+### 14.2 一轮一个 JSON，如何对应
+
+新文件位置：`trajectories/<task_id>/{single,agent}/turn-000.json`，编号从 0 起算，每次模型轮次加一。普通工具轮次包含一次模型输出和一次工具调用/返回；并非每轮都一定有真实工具返回。
+
+| 字段 | 含义 |
+|---|---|
+| turn、mode | 当前轮次和 single/agent 模式。 |
+| status | generating、generated、tool_running、completed，或 invalid_tool_call、submitted、error、interrupted 等状态。 |
+| started_at、finished_at | 北京时间；未收尾时 finished_at 为 null。进程强制退出时应结合 status 判断完整性。 |
+| content | 完整模型原文，包括可能的思考文本和工具调用文本，不只保存抽取后的代码。 |
+| generation | 原生成结果中除 text 外的 token、生成耗时、停止原因等信息。 |
+| tool_call | 工具 id/name/arguments；无合法调用时为 null。 |
+| tool_response | 完整结构化反馈；没有真实返回时为 null。非法格式轮次保存的是控制器修复提示，不代表执行了工具。 |
+| tool_response_meta | 反馈 token 数和是否截断；发生截断时另存 returned_text，便于核对模型实际看到的文本。 |
+| parse_error、artifact_result、error_type、error | 按需出现，分别记录格式错误、single 写入文件列表和失败原因。 |
+
+生成开始、生成完成、工具执行前和本轮收尾均原子保存，避免工具失败后丢掉已完成的模型原文。single 只生成一次，不执行 Agent 工具，其产物记录在 artifact_result。submit 由控制器消费后结束交互，不伪造工具返回；最终编译/正确性/测时/隐藏验收仍写入 result.json 及 evaluations。上下文耗尽且未调用模型的轮次，也会留下明确停止原因。
+
+以后不再新建 generation-XXX.json、tool-XXX.json；历史文件保持不动。`p1.status` 可读取新旧格式，按轮号去重计数。
+
+### 14.3 已执行的少量 GPU 验证
+
+遵照用户授权，从实际配置 `[6,7]` 中使用评测 GPU 6，按数字编号调用。验证没有加载 Qwen 重新生成代码；交互输出是预设夹具，用于检查真实工具、容器、编译、CUDA 执行与日志能否衔接，不能作为模型能力结果。
+
+| 验证 | 实际结果 | 能说明什么 |
+|---|---|---|
+| 官方 AXPBY 示例的绑定错误重现及位置参数修复 | 重现 TypeError；反馈保留函数签名与位置参数提示；改为位置参数后 5/5 反馈案例通过，根目录头文件 include 也编译成功。 | 编译路径、错误反馈和修复后的 CUDA 正确性验证已连通。 |
+| 六轮交互日志 | 生成 6 个 turn 文件；4 轮完成工具返回，另有非法格式轮和 submit 轮；未产生分离的 generation/tool 文件。 | 正常、非法输出和提交分支的记录结构一致，状态计数正确。 |
+| BROS 原始参考任务 | reference_prepare、reference_bench 均成功，compile_correct=true，仍使用 weights_only=True。 | 缺依赖及配置对象快照问题已解决；不代表该题的 Qwen 候选已正确。 |
+| softmax＋median 原始参考任务 | 明确复现 output[1] 的 int64 索引在重复调用中有 1/256 不同。 | 属于参考输出的不稳定，不能归因为候选 CUDA 错误；目前仍按严格规则隔离。 |
+
+AXPBY 虽通过反馈正确性检查，其最终前后基线漂移超过当前阈值，timing_valid=false，因此没有有效 speedup，也没有通过最终验收；本次未处理 GPU 占用，未更改漂移标准或宣称性能通过。median 是否允许多个等价索引属于评测语义变更，需要先讨论，当前没有放宽。
+
+阶段证据保存在 `.runtime/tmp/p1-fixes-20261028/`：validation.json、turn-validation-*、median-replay-*、transformers-replay-*；kernel-before.json、kernel-after.json 和安装日志记录依赖前后差异。该目录是诊断证据，不是正式 run。
+
+### 14.4 下一次运行和仍需区分的问题
+
+本次修改了提示词、工具反馈、快照和日志实现。pilot 的 `--resume` 现在核对 manifest 中的源码指纹；已有指纹与当前源码不同时要求新建 run，防止混合新旧实验。只有同配置、同源码的中断运行才继续恢复；换 GPU 编号仍被允许。串行及并行路径都先归档未完成轨迹，不在原轨迹上覆盖重生成。
+
+本次没有修改既有正式失败结果。模型生成代码中的 state_dict 不兼容、错误的 cuDNN 调用、数值不一致、错误 reshape、内存越界等，仍须在新实验中由模型根据改进反馈修复；基础设施修好不等于这些算法错误自动消失。两道近常数参考题和 median 的严格拒绝规则也保持原样。
+
+```bash
+# 在当前服务器项目根目录启动全新实验；执行前自行确认配置的卡号及可用性。
+bash scripts/p1-run.sh --run runs/p1/pilot-after-fixes
+```

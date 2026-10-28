@@ -1,6 +1,6 @@
 # P1 入口
 
-更新日期：2026-10-26。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
+更新日期：2026-10-28。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
 
 ## 只看 eager/torch.compile
 
@@ -41,7 +41,7 @@ Ctrl+C 或向控制器发 TERM 会停止派新题，等待各卡当前题结束�
 
 ## 运行 Qwen single/agent pilot
 
-当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；默认 GPU 2 生成、GPU 3 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，按题并行，评测卡整组租用，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡吞吐和 128K GPU 流程仍需实际运行验证。
+当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；当前配置 GPU [4,5] 生成、[6,7] 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，按题并行，评测卡整组租用，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡/长上下文流程已在此前 pilot 执行；当前修复及少量 GPU 验证结果见报告第 14 节。
 
 ```bash
 cd /home/likun/junjxu/CUDA-Agent
@@ -51,7 +51,7 @@ bash scripts/p1-run.sh --run runs/p1/pilot-train-v3 --dry-run
 bash scripts/p1-run.sh --run runs/p1/pilot-train-v3
 ```
 
-已有运行目录需显式 `--resume`；允许更换生成/评测卡号及卡数，其余配置须一致；新实验不要恢复其他 run。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
+已有运行目录需显式 `--resume`；允许更换生成/评测卡号及卡数，其余配置及 manifest 保存的源码指纹须一致；本次修复后应新建 run，不混合新旧结果。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
 
 同一题的 single、agent 及最终隐藏验收全部结束、两条结果保存后，才删除共享的
 `references/<id>/cases/input-spec/`、`compile-cache/`；不删除轨迹、候选源码或结果文件。
@@ -100,3 +100,9 @@ PYTHONPATH=src python -B tests/p1/sandbox_smoke.py
 新基线运行的 JSON 首条记录、CSV/Markdown 表格首个数据行均为 MEAN，统计各数值指标的算术均值并记录处理/成功/拒绝数量。
 均值按成功样本中每列实际存在的有限值计算，不把拒绝或缺失值补零；manifest 在 task_ids 前记录 task_count。
 三种汇总逐题共同更新，REPORT 另列拒绝阶段和原因；完整错误仍保存在阶段详情中。
+
+## 逐轮日志与本次修复
+
+新运行每轮只保存 `turn-XXX.json`，包含 `content`、`generation`、`tool_call`、`tool_response` 和状态/北京时间；无合法调用或 submit 时不伪造工具执行。旧日志不迁移，status 兼容两种格式。
+
+kernel 环境补充依赖统一记录在 `reports/p0/requirements.txt` 的相关条目及说明中。参考缺依赖会明确报基础设施错误；权重快照保持 `weights_only=True`，构造参数按可信参考和固定种子重建。完整说明、GPU 验证边界与仍未解决的模型代码问题见报告第 14 节。
