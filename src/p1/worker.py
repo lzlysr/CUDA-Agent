@@ -26,6 +26,15 @@ SAVE = torch.save
 CLOCK = time.perf_counter
 
 
+class ReferenceValidationError(ValueError):
+    """记录参考程序未通过现有预检的具体原因；不改变数值判定标准。"""
+
+    def __init__(self, kind, message):
+        """输入原因代码与可读诊断；供 main 写入阶段结果，无返回值。"""
+        super().__init__(message)
+        self.kind = kind
+
+
 # 返回两个布尔值，顺序固定为矩阵乘法 TF32、cuDNN TF32，供执行前后对照。
 def flags():
     """无输入；返回 matmul 和 cuDNN 的 TF32 状态列表。"""
@@ -135,12 +144,14 @@ def case_list(phase, cfg):
 
 
 # mod 是模型模块，klass 是 Model/ModelNew，init_seed 指定参数快照；返回 GPU 模型。
-def load_model(mod, klass, init_seed):
-    """输入模块、类名和初始化种子；严格加载固定参数，返回 eval 模式 GPU 模型。"""
-    # 读取可信 input-spec 中对应种子的快照，包含构造参数 init 和权重 state。
+def load_model(mod, klass, init_seed, input_spec):
+    """输入模型模块、类名、种子和可信参考模块；重建构造参数并严格恢复权重，返回 GPU 模型。"""
+    # 快照仅含权重；保持 weights_only=True，不反序列化任意配置类或 Python 对象。
     d = torch.load(Path("/inputs") / f"state-{init_seed}.pt", weights_only=True)
-    # 按类名取得模型类，用相同构造参数建模，再切换 eval 模式并放到 GPU。
-    m = getattr(mod, klass)(*d["init"]).eval().cuda()
+    # 构造参数来自已经允许执行的只读参考接口；不能让候选自行提供 get_init_inputs。
+    seed(init_seed)
+    init = as_list(input_spec.get_init_inputs())
+    m = getattr(mod, klass)(*init).eval().cuda()
     # 严格恢复固定 state_dict；参数键缺失、多余或张量形状不兼容会触发错误。
     m.load_state_dict(d["state"], strict=True)
     return m
@@ -161,8 +172,8 @@ def prepare(cfg):
         init = as_list(mod.get_init_inputs())
         # 实例化题目的原始 Model，切到推理模式并移动到 GPU。
         m = mod.Model(*init).eval().cuda()
-        # 保存构造参数和 CPU 版 state_dict，后续所有模型都严格恢复这份参数。
-        SAVE({"init": init, "state": cpu(m.state_dict())}, out / "input-spec" / f"state-{s}.pt")
+        # 只保存 CPU 权重；BrosConfig 等构造参数按相同种子从可信参考接口重建，避免不安全 pickle。
+        SAVE({"state": cpu(m.state_dict())}, out / "input-spec" / f"state-{s}.pt")
         # 先检查初始化、非有限值与确定性；更完整的输入验收在候选评测阶段执行。
         outputs = []
         # 用两个固定输入种子检查参考行为。
@@ -174,26 +185,51 @@ def prepare(cfg):
             b = call(m, tree(inp, lambda t: t.clone()))
 
             # x/y 是同一个参考模型两次执行的输出；递归比较，不匹配时抛出异常。
-            def equal(x, y):
-                """输入同一参考程序的两次输出；递归确认完全一致，不一致抛错，返回 None。"""
+            def equal(x, y, path="output"):
+                """输入两次参考输出及节点路径；严格比较，失败保留路径/种子，返回 None。"""
+                context = f"{path}; init_seed={s}, input_seed={input_seed}"
+                if type(x) is not type(y):
+                    raise ReferenceValidationError(
+                        "reference_nondeterministic", f"Reference output type changed at {context}"
+                    )
                 # 张量节点执行有限性检查和零容差数值比较。
                 if isinstance(x, torch.Tensor):
                     # 显式检查浮点输出中是否存在 NaN 或 Inf。
-                    if x.is_floating_point() and not torch.isfinite(x).all():
-                        raise ValueError("reference has nonfinite output")
+                    if (x.is_floating_point() or x.is_complex()) and not torch.isfinite(x).all():
+                        raise ReferenceValidationError(
+                            "reference_nonfinite", f"Reference has nonfinite output at {context}"
+                        )
                     # atol/rtol 都为 0，要求数值完全相等，且不接受 NaN 与 NaN 相等。
-                    torch.testing.assert_close(x, y, atol=0, rtol=0, equal_nan=False)
+                    try:
+                        torch.testing.assert_close(x, y, atol=0, rtol=0, equal_nan=False)
+                    except AssertionError as error:
+                        raise ReferenceValidationError(
+                            "reference_nondeterministic",
+                            f"Reference repeated output differs at {context}; "
+                            f"dtype={x.dtype}, shape={tuple(x.shape)}\n{error}",
+                        ) from error
                 # 列表或元组按对应位置递归检查。
                 elif isinstance(x, (list, tuple)):
-                    for v, w in zip(x, y):
-                        equal(v, w)
+                    if len(x) != len(y):
+                        raise ReferenceValidationError(
+                            "reference_nondeterministic", f"Reference output length changed at {context}"
+                        )
+                    for index, (v, w) in enumerate(zip(x, y)):
+                        equal(v, w, f"{path}[{index}]")
                 # 字典按当前输出的键递归检查对应值。
                 elif isinstance(x, dict):
+                    if x.keys() != y.keys():
+                        raise ReferenceValidationError(
+                            "reference_nondeterministic", f"Reference output keys changed at {context}"
+                        )
                     for k in x:
-                        equal(x[k], y[k])
+                        equal(x[k], y[k], f"{path}[{k!r}]")
                 # 普通标量使用精确相等断言。
                 else:
-                    assert x == y
+                    if x != y:
+                        raise ReferenceValidationError(
+                            "reference_nondeterministic", f"Reference scalar output changed at {context}"
+                        )
 
             # 确认这组输入的两次参考输出一致后，再采样记录输出统计。
             equal(a, b)
@@ -280,7 +316,13 @@ def compile_candidate():
     # 从实际导入的 torch 路径定位 kernel 环境的 site-packages。
     site = Path(torch.__file__).resolve().parents[1]
     # 允许扩展使用该环境中 NVIDIA cuDNN/cuBLAS 包提供的头文件。
-    includes = [str(site / "nvidia/cudnn/include"), str(site / "nvidia/cublas/include")]
+    includes = [
+        # 固定注册头在候选根目录；同时兼容 binding_registry.h 和 ../binding_registry.h。
+        "/candidate",
+        "/candidate/kernels",
+        str(site / "nvidia/cudnn/include"),
+        str(site / "nvidia/cublas/include"),
+    ]
     # 指定 cuDNN/cuBLAS 动态库的实际文件路径，供链接阶段使用。
     libs = [site / "nvidia/cudnn/lib/libcudnn.so.9", site / "nvidia/cublas/lib/libcublas.so.12"]
     # 开始构建并加载扩展；发生编译、链接或加载错误时异常由 main 收集。
@@ -454,10 +496,10 @@ def bench(cfg, candidate=False):
         # 动态加载冻结的候选 Python 入口文件。
         mod = load("/candidate/model_new.py", "candidate_model")
         # 恢复反馈初始化种子 71001 对应的固定参数。
-        model = load_model(mod, "ModelNew", 71001)
+        model = load_model(mod, "ModelNew", 71001, inpmod)
     else:
         # 参考分支用同一份固定参数恢复原始 Model。
-        model = load_model(inpmod, "Model", 71001)
+        model = load_model(inpmod, "Model", 71001, inpmod)
     # 性能测试统一使用 feedback 案例的输入种子，先生成全部 GPU 样本。
     samples = [inputs_for(inpmod, c["input_seed"]) for c in case_list("feedback", cfg)]
     # 在测时开始前记录两项 TF32 设置。
@@ -584,7 +626,7 @@ def stream(cfg, phase, candidate):
         s = case["init_seed"]
         # 首次遇到该种子时，才创建并恢复对应模型实例。
         if s not in models:
-            models[s] = load_model(mod, klass, s)
+            models[s] = load_model(mod, klass, s, inpmod)
         # 后续同一种子的输入复用已加载模型。
         m = models[s]
         # 按本例输入种子调用可信 get_inputs，重建 GPU 输入。
@@ -688,6 +730,11 @@ def main():
             "traceback": traceback.format_exc()[-10000:],
             "elapsed_seconds": CLOCK() - started,
         }
+        # 环境缺依赖与参考程序自身不稳定分别记录，避免把二者都解释成数据无效。
+        if isinstance(e, (ModuleNotFoundError, ImportError)):
+            result.update(failure_kind="missing_dependency", missing_module=getattr(e, "name", None))
+        elif isinstance(e, ReferenceValidationError):
+            result["failure_kind"] = e.kind
     # 与控制器使用相同的阶段文件名；宿主读取后会在同一文件补上 controller_seconds。
     result_name = {
         "reference_prepare": "prepare_result.json",

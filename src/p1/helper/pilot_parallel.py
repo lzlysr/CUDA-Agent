@@ -370,7 +370,10 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
         """读取已有预检或租卡准备参考；缺少最终索引的旧参考目录先归档。"""
         index = pilot.run / "references" / task["task_id"] / "preflight.json"
         if index.exists():
-            return json.loads(index.read_text())
+            cached = json.loads(index.read_text())
+            # 缺依赖等基础设施故障可在环境修复后重试，不能当作永久拒绝跳过。
+            if cached.get("status") in {"ok", "task_invalid"}:
+                return cached
         if stop.is_set():
             raise InterruptedError("停止参考预检")
         if not hasattr(local, "evaluator"):

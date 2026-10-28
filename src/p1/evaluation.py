@@ -72,7 +72,10 @@ def compare(actual, expected, atol=0.01, rtol=0.01):
         if isinstance(a, torch.Tensor):
             # 相同数值但形状或精度类型不同，也不符合原模型的输出合同。
             if a.shape != b.shape or a.dtype != b.dtype:
-                errors.append(key + ": shape/dtype differs")
+                errors.append(
+                    f"{key}: shape/dtype differs; expected {tuple(b.shape)} {b.dtype}, "
+                    f"got {tuple(a.shape)} {a.dtype}"
+                )
                 return
             # 仅浮点/复数张量统计连续数值误差；整数等类型仍会经过下方 assert_close。
             if a.is_floating_point() or a.is_complex():
@@ -91,8 +94,9 @@ def compare(actual, expected, atol=0.01, rtol=0.01):
                 # 容差判定使用 atol/rtol；equal_nan=False 明确禁止两边同为 NaN 时算通过。
                 torch.testing.assert_close(a, b, atol=atol, rtol=rtol, equal_nan=False)
             # 数值断言失败只转成当前节点的错误记录，让其他输出节点仍可继续检查。
-            except AssertionError:
-                errors.append(key + ": numerical mismatch")
+            except AssertionError as error:
+                # 保留实际不匹配比例、最大误差位置，供 Agent 定位归约/索引/精度错误。
+                errors.append(key + ": numerical mismatch\n" + str(error)[:1500])
         # 列表和元组分支：先检查长度，然后按位置逐项递归。
         elif isinstance(a, (list, tuple)):
             # 长度不同意味着输出结构不完整或多出内容，无需继续 zip 截断比较。
@@ -405,6 +409,14 @@ class Evaluator:
             "status": "task_invalid",
             "prepare_result_path": (ref / "cases/prepare_result.json").relative_to(self.run).as_posix(),
         }
+        if prepared.get("failure_kind") == "missing_dependency":
+            preflight["status"] = "infrastructure_error"
+            dump(ref / "preflight.json", preflight)
+            raise InfrastructureError(
+                "Kernel environment cannot import a reference dependency: "
+                f"{prepared.get('missing_module') or prepared.get('error')}; "
+                f"see {preflight['prepare_result_path']}"
+            )
         # 仅预检正常且没有近常数退化时继续测量，具体拒绝原因保留在预检结果中。
         if prepared["status"] == "ok" and not prepared.get("near_constant_sampled_output"):
             bench = self.container(
@@ -417,6 +429,14 @@ class Evaluator:
             preflight["bench_result_path"] = (
                 (ref / "initial-bench/bench_result.json").relative_to(self.run).as_posix()
             )
+            if bench.get("failure_kind") == "missing_dependency":
+                preflight["status"] = "infrastructure_error"
+                dump(ref / "preflight.json", preflight)
+                raise InfrastructureError(
+                    "Kernel environment cannot import a reference dependency: "
+                    f"{bench.get('missing_module') or bench.get('error')}; "
+                    f"see {preflight['bench_result_path']}"
+                )
             preflight["status"] = "ok" if bench["status"] == "ok" else "task_invalid"
         # 索引不再嵌套复制参数审计、profile 或计时数据。
         dump(ref / "preflight.json", preflight)
@@ -447,6 +467,10 @@ class Evaluator:
                 "reference_bench", output, reference=ref, inputs=ref / "cases/input-spec", timeout=300
             )
             result_path = (output / "bench_result.json").relative_to(self.run).as_posix()
+        if result.get("failure_kind") == "missing_dependency":
+            raise InfrastructureError(
+                f"Reference dependency missing: {result.get('missing_module')}; see {result_path}"
+            )
         return dict(result, reference_only=True, result_path=result_path)
 
     # 七、冻结候选源码：workspace 是 Agent 开发目录，快照只复制允许的源码文件。

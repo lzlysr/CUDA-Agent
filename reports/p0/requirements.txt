@@ -1,3 +1,7 @@
+# 本文件记录 learner 完整依赖；P1 kernel 的补充依赖也统一记录于此。
+# P1 kernel 补充：transformers 5.9.0、huggingface-hub 1.33.0、tokenizers 0.22.2、safetensors 0.8.0。
+# 下方对应条目已固定版本，不重复声明；它们与当前 learner 版本一致。
+# kernel 按需补充这些包时应冻结既有包版本，不替换 torch/CUDA 栈；不要将整份 learner 清单作为 kernel 重建清单。
 -e /home/likun/junjxu/CUDA-Agent/third_party/verl
 absl-py==2.5.1
     # via tensorboard
@@ -219,6 +223,7 @@ httpx2==2.13.1
     #   mcp
     #   openai
 huggingface-hub==1.33.0
+    # 同时用于 P1 kernel 参考任务的补充依赖。
     # via
     #   accelerate
     #   datasets
@@ -648,6 +653,7 @@ rpds-py==2026.9.1
     #   jsonschema
     #   referencing
 safetensors==0.8.0
+    # 同时用于 P1 kernel 参考任务的补充依赖。
     # via
     #   accelerate
     #   peft
@@ -706,6 +712,7 @@ tiktoken==0.14.0
 tilelang==0.1.9
     # via vllm
 tokenizers==0.22.2
+    # 同时用于 P1 kernel 参考任务的补充依赖。
     # via
     #   transformers
     #   vllm
@@ -749,6 +756,7 @@ tqdm==4.70.1
     #   transformers
     #   vllm
 transformers==5.9.0
+    # 同时用于 P1 kernel 参考任务的补充依赖。
     # via
     #   compressed-tensors
     #   peft
