@@ -11,6 +11,7 @@ from pathlib import Path
 import time
 
 from .data import ROOT, dump
+from .helper.turn_log import turn_counts
 
 RUN = ROOT / "runs/p1/pilot-seed42"
 
@@ -52,8 +53,7 @@ def status(run=RUN):
             else:
                 row[mode] = {
                     "status": "not_scored",
-                    "completed_generations": len(list(directory.glob("generation-*.json"))),
-                    "completed_tools": len(list(directory.glob("tool-*.json"))),
+                    **turn_counts(directory),
                 }
         rows.append(row)
     return {

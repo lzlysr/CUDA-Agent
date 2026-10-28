@@ -21,17 +21,41 @@ import traceback
 
 from .data import ROOT, sha
 from .helper.baseline_state import (
-    atomic_json as dump, beijing_now, cleanup_reference_artifacts, exclusive_lock, run_lock_path, guard_active_containers,
+    archive_incomplete, atomic_json as dump, beijing_now, cleanup_reference_artifacts,
+    exclusive_lock, run_lock_path, guard_active_containers,
 )
-from .helper.pilot_parallel import gpu_roles
+from .helper.pilot_parallel import archive_partial_trajectory, gpu_roles
 from .helper.progress import PilotProgress
+from .helper.turn_log import TurnLog
 from .evaluation import Evaluator, InfrastructureError
 
 from .tools import TOOLS, WorkspaceTools
 from .sandbox import SandboxSession
 
 
-CONTRACT = """You optimize PyTorch tasks for NVIDIA A100 sm_80 using CUDA C++ (CUDA 12.9, torch 2.11.0+cu129). Keep the ModelNew constructor and state_dict fully compatible with Model. Python forward may allocate tensors, inspect metadata and call cuda_extension, but must not compute with PyTorch, torch.compile, Triton or other libraries. Use raw CUDA kernels; cuBLAS only for GEMM and cuDNN only for convolution are allowed. Never alter global precision or evaluation state. Both reference and candidate allow TF32; atol=rtol=1e-2. Do not cache outputs for input values. Implement model_new.py plus kernels/*.cu and *_binding.cpp. The supplied binding.cpp and binding_registry.h are fixed. Include ../binding_registry.h and register bindings with REGISTER_BINDING(name, function). Use torch/types.h and torch/csrc/utils/pybind.h, c10::cuda::getCurrentCUDAStream(), allocate outputs and launch CUDA. Do not include your own PYBIND11_MODULE; the fixed binding does this. Output creation and nn.Module parameter declarations in __init__ are allowed. Use direct cuda_extension calls in forward. Preserve weights exactly by matching the reference module hierarchy. Aim to beat eager and torch.compile by >5%."""
+CONTRACT = """You optimize PyTorch tasks for NVIDIA A100 sm_80 using CUDA C++.
+Environment: CUDA 12.9, torch 2.11.0+cu129, cuDNN 9.17, cuBLAS 12.9.
+Keep the ModelNew constructor and state_dict fully compatible with Model.
+Preserve the original parameter/module hierarchy, parameter names and buffers exactly.
+Python forward may allocate tensors, inspect metadata and call cuda_extension,
+but must not compute with PyTorch, torch.compile, Triton or other libraries.
+Calling an existing nn.Module's forward is also a PyTorch compute fallback.
+Use raw CUDA kernels; cuBLAS only for GEMM and cuDNN only for convolution are allowed.
+Never alter global precision or evaluation state. Both reference and candidate allow
+TF32; atol=rtol=1e-2. Do not cache outputs for input values.
+Implement model_new.py plus kernels/*.cu and *_binding.cpp. The supplied binding.cpp
+and binding_registry.h are fixed: do not return or overwrite these files.
+Include ../binding_registry.h and register bindings with REGISTER_BINDING(name, function).
+Use torch/types.h and torch/csrc/utils/pybind.h, c10::cuda::getCurrentCUDAStream(),
+allocate outputs and launch CUDA. Do not include your own PYBIND11_MODULE.
+Use positional Python arguments unless m.def explicitly names arguments with py::arg.
+For every binding, match the argument count, order, types and return structure.
+Obtain dimensions from the actual input and preserve output shapes, dtypes and tuple order.
+Guard every global-memory access, including vectorized-load tails and reduction indices.
+Output creation and nn.Module parameter declarations in __init__ are allowed.
+Use direct cuda_extension calls in forward. Inspect installed cuDNN headers rather than
+guessing API signatures: use named cudnn enum constants, not untyped integer arguments.
+Aim to beat eager and torch.compile by >5%."""
 
 
 def safe_path(workspace, name, writing=False):
@@ -54,15 +78,19 @@ def safe_path(workspace, name, writing=False):
 
 
 def write_files(workspace, files):
-    """输入工作区及路径→源码字典；写入 single 生成的完整文件，返回已写路径。"""
+    """输入工作区及路径→源码字典；先验证全部文件再写入，返回已写路径。"""
     if not isinstance(files, dict) or not files:
         raise ValueError("files must be a nonempty path->source dictionary")
+    prepared = []
+    # 任一文件越界或内容无效时，整次提交不写入，避免留下一半新、一半旧的源码。
     for name, text in files.items():
         p = safe_path(workspace, name, True)
         if not isinstance(text, str) or len(text.encode()) > 1000000:
             raise ValueError("invalid source file or file too large")
+        prepared.append((p, text))
+    for p, text in prepared:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        p.write_text(text, encoding="utf-8")
     return {"written": list(files)}
 
 
@@ -111,6 +139,27 @@ def generation_budget(cfg, agent, prompt_tokens):
     context = cfg["context_tokens"] if agent else cfg["single_context_tokens"]
     remaining = max(0, context - prompt_tokens)
     return min(remaining, cfg.get("generation_tokens") or remaining)
+
+
+def summarize_error(error):
+    """输入完整编译/执行错误；返回保留关键诊断的短文本，不修改原始日志。"""
+    if "incompatible function arguments" in error and "Invoked with:" in error:
+        # pybind 会打印大型输入张量；优先保留支持的签名，而非只截取张量打印尾部。
+        signature, _, arguments = error.partition("Invoked with:")
+        kwargs = arguments.rpartition("kwargs:")[-1] if "kwargs:" in arguments else "none shown"
+        return signature[:3500] + "\n[Tensor values omitted]\nKeyword arguments: " + kwargs[:1000]
+    lines = error.splitlines()
+    diagnostics = []
+    for index, line in enumerate(lines):
+        if any(word in line.lower() for word in ["error:", "fatal error", "undefined reference", "undefined symbol"]):
+            diagnostics.extend(lines[max(0, index - 1):index + 3])
+    if diagnostics:
+        # 重复模板实例化错误只保留第一次，避免同一条信息占满上下文。
+        return "\n".join(dict.fromkeys(diagnostics))[:5000]
+    if len(error) <= 5000:
+        return error
+    # 通用异常保留首尾：异常类型/签名通常在开头，具体参数或路径可能在结尾。
+    return error[:3000] + "\n[Middle omitted; full error is in the evaluation log]\n" + error[-1500:]
 
 
 class Pilot:
@@ -165,8 +214,8 @@ class Pilot:
             self.llm = None
         self.tokenizer = None
 
-    def generate(self, messages, tools, seed, out):
-        """输入消息、是否启用工具、种子和日志路径；返回生成文本、token 数、停止原因和时间。"""
+    def generate(self, messages, tools, seed):
+        """输入消息、是否启用工具和种子；返回文本与生成统计，由调用方写入统一轮次日志。"""
         from vllm import SamplingParams
 
         text = self.tokenizer.apply_chat_template(
@@ -204,7 +253,6 @@ class Pilot:
             "stop_reason": res.stop_reason,
             "seconds": time.monotonic() - start,
         }
-        dump(out, result)
         return result
 
     def prompt(self, task, agent):
@@ -216,12 +264,21 @@ class Pilot:
             skill = (ROOT / "upstream/CUDA-Agent/agent_workdir/SKILL.md").read_text()
             user = (
                 f"Use the tools to analyze the original performance first, write files, compile/check, improve, then submit. Up to {self.cfg['max_turns']} interactions within {self.cfg['context_tokens']} tokens. Bash is persistent. Original commands bash utils/compile.sh, python3 -m utils.verification, and python3 -m utils.profiling are available and dispatch jobs to the GPU sandbox. Use python3 -m utils.profiling --reference-only before creating model_new.py, or call profile_reference. Read existing files before editing. Final scoring selects the fastest correct trajectory candidate. Search feedback uses five inputs; hidden results are never provided. No web/network tools.\n"
+                "Local environment overrides SKILL examples: target sm_80, not sm_90; do not use sudo. "
+                "Bash has no GPU; use the provided utils commands for GPU work. "
+                "Fix the reported failure stage before attempting further performance optimization.\n"
                 + skill
                 + interface
             )
         else:
             user = (
-                'Generate one complete solution with no execution feedback. Return only JSON {"files":{"model_new.py":"...","kernels/kernel.cu":"...","kernels/kernel_binding.cpp":"..."}} after your reasoning. All file contents must be complete.'
+                'Generate one complete solution with no execution feedback. Return only a JSON object '
+                '{"files":{"model_new.py":"...","kernels/kernel.cu":"...","kernels/kernel_binding.cpp":"..."}} '
+                'after your reasoning. All file contents must be complete. model_new.py must define '
+                'class ModelNew and import cuda_extension directly. Only model_new.py and source files '
+                'directly under kernels/ are writable; omit binding.cpp, binding_registry.h, model.py, '
+                'utils/, setup.py and other files. Escape source newlines inside JSON strings. '
+                'Do not replace the JSON object with Markdown Python/CUDA code blocks.\n'
                 + interface
             )
         return [{"role": "system", "content": CONTRACT}, {"role": "user", "content": user}]
@@ -246,29 +303,54 @@ class Pilot:
             "profiles",
             "profile",
             "runtime_fallbacks",
+            "error",
+            "error_type",
+            "failure_kind",
+            "missing_module",
         ]
         feedback = {key: result[key] for key in keys if key in result}
+        hints = []
         for section in ["compilation", "execution"]:
-            error = result.get(section, {}).get("error", "")
+            detail = result.get(section, {})
+            error = detail.get("error", "")
             if error:
-                lines = error.splitlines()
-                diagnostics = []
-                for index, line in enumerate(lines):
-                    if any(
-                        word in line.lower()
-                        for word in [
-                            "error:",
-                            "fatal error",
-                            "undefined reference",
-                            "undefined symbol",
-                        ]
-                    ):
-                        diagnostics.extend(lines[max(0, index - 1) : index + 3])
-                feedback[section + "_error"] = (
-                    "\n".join(diagnostics[:30]) if diagnostics else error[-5000:]
-                )
+                feedback["failure_stage"] = section
+                feedback[section + "_error_type"] = detail.get("error_type")
+                feedback[section + "_error"] = summarize_error(error)
+                if "incompatible function arguments" in error:
+                    hints.append(
+                        "Check binding argument count/order/types. For an unnamed m.def binding, "
+                        "use positional arguments; keyword config= requires py::arg(\"config\") in C++."
+                    )
+                if "state_dict" in error:
+                    hints.append(
+                        "Keep the reference nn.Module hierarchy, parameter names and buffers. "
+                        "Do not rename nested weights or omit buffers; strict state_dict loading is required."
+                    )
+                if "illegal memory access" in error:
+                    hints.append(
+                        "Check launch sizes, tensor dimensions/strides, pointer types and every "
+                        "read/write bound, including vectorized tails. Compilation success "
+                        "does not establish memory safety."
+                    )
+                if "shape" in error and "invalid for input of size" in error:
+                    hints.append(
+                        "Derive the output allocation and reshape dimensions from the original operation. "
+                        "view/reshape cannot change the tensor element count."
+                    )
+                if "cudnn" in error.lower():
+                    hints.append(
+                        "Match the installed cuDNN 9 header signatures and use typed enum constants "
+                        "such as CUDNN_CROSS_CORRELATION and CUDNN_DATA_FLOAT."
+                    )
+        if result.get("issues"):
+            feedback["failure_stage"] = "contract"
+        if hints:
+            feedback["diagnostic_hints"] = list(dict.fromkeys(hints))
         checks = result.get("checks", [])
         if checks:
+            if any(not check["passed"] for check in checks) and "failure_stage" not in feedback:
+                feedback["failure_stage"] = "correctness"
             feedback.update(
                 checks_passed=sum(check["passed"] for check in checks),
                 checks_total=len(checks),
@@ -345,106 +427,135 @@ class Pilot:
             ):
                 termination = "time_limit"
                 break
-            g = self.generate(
-                messages,
-                mode == "agent",
-                self.cfg["seed"] + index * 1000 + turn,
-                out / f"generation-{turn:03d}.json",
-            )
-            tokens += g["completion_tokens"]
-            prompt_tokens += g["prompt_tokens"]
-            if not g["text"]:
-                termination = g.get("stop_reason", "empty_generation")
-                break
+            turn_log = TurnLog(out, turn, mode)
             try:
-                action = parse(g["text"])
-            except Exception:
-                action = None
-            if mode == "single":
-                if action and action[0] == "write_files":
-                    try:
-                        write_files(work, action[1]["files"])
-                        termination = "single_generated"
-                    except Exception as e:
-                        termination = "invalid_artifacts"
-                        events.append({"error": str(e)})
-                else:
-                    termination = (
-                        "generation_limit"
-                        if g.get("finish_reason") == "length"
-                        else "invalid_output_format"
+                g = self.generate(
+                    messages,
+                    mode == "agent",
+                    self.cfg["seed"] + index * 1000 + turn,
+                )
+                turn_log.generation(g)
+                tokens += g["completion_tokens"]
+                prompt_tokens += g["prompt_tokens"]
+                if not g["text"]:
+                    termination = g.get("stop_reason") or "empty_generation"
+                    turn_log.record["status"] = termination
+                    break
+                try:
+                    action = parse(g["text"])
+                except Exception as error:
+                    action = None
+                    turn_log.record["parse_error"] = str(error)
+
+                if mode == "single":
+                    if action and action[0] == "write_files":
+                        try:
+                            written = write_files(work, action[1]["files"])
+                            turn_log.record["artifact_result"] = written
+                            termination = "single_generated"
+                        except Exception as error:
+                            termination = "invalid_artifacts"
+                            turn_log.record["error"] = str(error)
+                            events.append({"error": str(error)})
+                    else:
+                        termination = (
+                            "generation_limit"
+                            if g.get("finish_reason") == "length"
+                            else "invalid_output_format"
+                        )
+                    turn_log.record["status"] = termination
+                    break
+
+                if action is None:
+                    # 无合法调用时，保留原文和解析结果，再给模型明确的格式修复提示。
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                g["text"].split("</think>", 1)[-1]
+                                if "</think>" in g["text"] else ""
+                            ),
+                            "reasoning_content": g["text"].split("</think>")[0],
+                        }
                     )
-                break
-            if action is None:
-                # 保留原始推理与无效输出；不暗中删历史来延长预算。
+                    repair = (
+                        "No valid tool call was found. Call one of the provided tools using "
+                        "its native function/parameter format. Use Edit/MultiEdit for focused "
+                        "patches instead of repeating complete files."
+                    )
+                    messages.append({"role": "tool", "content": repair})
+                    turn_log.record.update(
+                        status="invalid_tool_call",
+                        tool_response={"error": "invalid_tool_call", "message": repair},
+                    )
+                    events.append({"turn": turn, "error": "invalid_tool_call"})
+                    continue
+
+                name, args = action
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                tool_count += 1
+                tool_id = f"p1-{index}-{turn}"
+                turn_log.call(tool_id, name, args)
+                # 日志保留模型完整原文；后续上下文继续使用原生工具消息结构。
+                content = g["text"].split("<tool_call>")[0]
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": (
-                            g["text"].split("</think>", 1)[-1] if "</think>" in g["text"] else ""
-                        ),
-                        "reasoning_content": g["text"].split("</think>")[0],
+                        "content": content,
+                        "tool_calls": [
+                            {
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": args},
+                            }
+                        ],
                     }
                 )
+                if name == "submit":
+                    # submit 由控制器消费，不向已经结束的模型伪造一条工具返回。
+                    termination = "submitted"
+                    turn_log.record["status"] = termination
+                    break
+                try:
+                    feedback = toolbox.dispatch(name, args)
+                except InfrastructureError:
+                    raise
+                except Exception as error:
+                    feedback = {"error_type": type(error).__name__, "error": str(error)}
+                raw = json.dumps(feedback, ensure_ascii=False)
+                ids = self.tokenizer.encode(raw, add_special_tokens=False)
+                feedback_limit = self.cfg.get("tool_feedback_tokens")
+                was_truncated = feedback_limit is not None and len(ids) > feedback_limit
+                returned_text = (
+                    self.tokenizer.decode(ids[:feedback_limit]) if was_truncated else raw
+                )
+                turn_log.response(feedback, returned_text, len(ids), was_truncated)
                 messages.append(
                     {
-                        "role": "tool",
-                        "content": "No valid tool call was found. Call one of the provided tools using its native function/parameter format. Use Edit/MultiEdit for focused patches instead of repeating complete files.",
+                        "role": "tool", "tool_call_id": tool_id,
+                        "name": name, "content": returned_text,
                     }
                 )
-                events.append({"turn": turn, "error": "invalid_tool_call"})
-                continue
-            name, args = action
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-            tool_count += 1
-            tool_id = f"p1-{index}-{turn}"
-            # 原始推理完整存盘，并按原生模板传入后续工具上下文。
-            content = g["text"].split("<tool_call>")[0]
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": [
-                        {
-                            "id": tool_id,
-                            "type": "function",
-                            "function": {"name": name, "arguments": args},
-                        }
-                    ],
-                }
-            )
-            if name == "submit":
-                termination = "submitted"
-                break
-            try:
-                feedback = toolbox.dispatch(name, args)
-            except InfrastructureError:
+                events.append({"turn": turn, "tool": name, "elapsed": time.monotonic() - started})
+            except BaseException as error:
+                # 基础设施故障/中断也保存当前轮，不能因没有工具返回而丢失模型输出。
+                turn_log.record.update(
+                    status=(
+                        "interrupted" if isinstance(error, (InterruptedError, KeyboardInterrupt))
+                        else "error"
+                    ),
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
                 raise
-            except Exception as e:
-                feedback = {"error": str(e)}
-            raw = json.dumps(feedback, ensure_ascii=False)
-            ids = self.tokenizer.encode(raw, add_special_tokens=False)
-            feedback_limit = self.cfg.get("tool_feedback_tokens")
-            truncated = self.tokenizer.decode(ids[:feedback_limit])
-            dump(
-                out / f"tool-{turn:03d}.json",
-                {
-                    "name": name,
-                    "arguments": args,
-                    "feedback": feedback,
-                    "feedback_tokens": len(ids),
-                    "truncated": feedback_limit is not None and len(ids) > feedback_limit,
-                },
-            )
-            messages.append(
-                {"role": "tool", "tool_call_id": tool_id, "name": name, "content": truncated}
-            )
-            events.append({"turn": turn, "tool": name, "elapsed": time.monotonic() - started})
-            dump(out / "messages.json", messages)
+            finally:
+                turn_log.finish()
+                if mode == "agent":
+                    dump(out / "messages.json", messages)
         search_seconds = time.monotonic() - started
         if self.stop_event is not None and self.stop_event.is_set():
             raise InterruptedError("停止后不再启动最终候选及隐藏验收")
@@ -650,8 +761,12 @@ class Pilot:
             if self.stop_event is not None and self.stop_event.is_set():
                 raise InterruptedError("停止参考预检")
             dest = self.run / "references" / task["task_id"] / "preflight.json"
-            pre = json.loads(dest.read_text()) if dest.exists() else self.ev.prepare(task)
-            # 新预检索引由 Evaluator.prepare 写入；已有缓存只读取，不再复制详情。
+            pre = json.loads(dest.read_text()) if dest.exists() else None
+            # 只有成功或明确的任务拒绝才是终态；环境故障不能缓存成“题目无效”。
+            if pre is None or pre.get("status") not in {"ok", "task_invalid"}:
+                archive_incomplete(self.run, task["task_id"])
+                pre = self.ev.prepare(task)
+            # 新预检索引由 Evaluator.prepare 写入；完整终态缓存只读复用。
             if pre["status"] == "ok":
                 eligible.append(task)
             else:
@@ -698,6 +813,8 @@ class Pilot:
                     res = json.loads(dest.read_text())
                 else:
                     self.progress.write("START", task["task_id"], mode)
+                    # 与并行路径一致：中断轨迹先归档，再从第零轮重新开始，保留旧日志。
+                    archive_partial_trajectory(self.run, task["task_id"], mode)
                     res = self.trajectory(task, mode, index)
                 self.results.append(res)
                 self.save_result_summaries()
@@ -708,7 +825,7 @@ class Pilot:
 
 
 def validate_resume(cfg, output, resume):
-    """输入当前配置、输出目录和续跑标志；检查旧配置，仅 GPU 调度字段允许更换。"""
+    """输入配置、目录与续跑标志；检查配置及已有源码指纹，GPU 调度字段可换。"""
     manifest = output / "manifest.json"
     if not manifest.exists():
         if resume:
@@ -726,6 +843,17 @@ def validate_resume(cfg, output, resume):
     protocol = lambda value: {key: item for key, item in value.items() if key not in scheduling}
     if protocol(previous) != protocol(cfg):
         raise RuntimeError("模型、预算或评测配置与旧 run 不同，请使用新的运行目录")
+    saved_hashes = saved.get("code_sha256")
+    if saved_hashes:
+        current_hashes = {
+            str(path.relative_to(ROOT)): sha(path.read_bytes())
+            for path in (ROOT / "src/p1").rglob("*")
+            if path.is_file() and path.suffix in {".py", ".sh"}
+        }
+        if current_hashes != saved_hashes:
+            raise RuntimeError(
+                "P1 源码、提示词或日志实现与原 run 不同，不能混合新旧结果；请使用新的运行目录"
+            )
 
 
 def check_gpu_devices(devices):
@@ -739,7 +867,7 @@ def check_gpu_devices(devices):
     for gpu in devices:
         if gpu not in available:
             raise RuntimeError(f"GPU 编号不存在：{gpu}")
-        if available[gpu] > 100:
+        if available[gpu] > 60000:
             raise RuntimeError(f"GPU {gpu} 已占用 {available[gpu]} MiB；不会停止现有进程")
 
 
