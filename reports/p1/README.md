@@ -1,6 +1,6 @@
 # P1 入口
 
-更新日期：2026-10-28。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
+更新日期：2026-10-31。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
 
 ## 只看 eager/torch.compile
 
@@ -106,3 +106,7 @@ PYTHONPATH=src python -B tests/p1/sandbox_smoke.py
 新运行每轮只保存 `turn-XXX.json`，包含 `content`、`generation`、`tool_call`、`tool_response` 和状态/北京时间；无合法调用或 submit 时不伪造工具执行。旧日志不迁移，status 兼容两种格式。
 
 kernel 环境补充依赖统一记录在 `reports/p0/requirements.txt` 的相关条目及说明中。参考缺依赖会明确报基础设施错误；权重快照保持 `weights_only=True`，构造参数按可信参考和固定种子重建。完整说明、GPU 验证边界与仍未解决的模型代码问题见报告第 14 节。
+
+## 隐藏验收预算
+
+当前每个初始化使用 5 个隐藏基础输入，两组共执行 34 次比较。反馈阶段总预算仍为 evaluation_seconds=120 秒；隐藏阶段独立使用 hidden_evaluation_seconds=600 秒，两端容器及控制器同步切换，控制器另留 5 秒收尾。编译和显式 300 秒的参考预检/测量预算不变。该改动及真实单题诊断证据见 P1_REPORT.md 第 15 节；不自动重跑或修改旧结果。

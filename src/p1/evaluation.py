@@ -616,6 +616,13 @@ class Evaluator:
         checks = []
         # 控制器循环也设总等待预算，避免无限等待输出握手。
         started = time.monotonic()
+        # 隐藏验收使用独立的总墙钟预算，包含输入重建、输出传输、CPU 比较和握手等待。
+        # 未配置新字段时沿用原预算，保持旧配置的执行方式；反馈阶段仍使用 evaluation_seconds。
+        stream_seconds = (
+            self.cfg.get("hidden_evaluation_seconds", self.cfg["evaluation_seconds"])
+            if phase == "hidden"
+            else self.cfg["evaluation_seconds"]
+        )
         # 两个线程分别同步等待各自容器；主线程负责读取和比较两边输出。
         with ThreadPoolExecutor(max_workers=2) as pool:
             # rf 是参考容器任务的 Future，供后续检查完成状态并取回结构化结果。
@@ -627,6 +634,7 @@ class Evaluator:
                 # 双方读同一套固定参数/输入定义，从种子生成相同测试输入。
                 inputs=ref / "cases/input-spec",
                 phase=phase,
+                timeout=stream_seconds,
             )
             # cf 是候选容器任务的 Future；该容器可见候选快照和本次构建产物。
             cf = pool.submit(
@@ -637,9 +645,11 @@ class Evaluator:
                 inputs=ref / "cases/input-spec",
                 build=build,
                 phase=phase,
+                timeout=stream_seconds,
             )
-            # 轮询预算为评测秒数再加 5 秒余量；容器本身还受 container 的超时限制。
-            while time.monotonic() - started < self.cfg["evaluation_seconds"] + 5:
+            # 握手循环与两端容器共用当前阶段的预算，另加 5 秒收尾余量。
+            # 若只延长容器预算而不改此循环，控制器仍会提前停止消费输出。
+            while time.monotonic() - started < stream_seconds + 5:
                 # 每端只有一个待确认的 item.pt 槽位，worker 在该文件被删除前不会发布下一例。
                 a, b = expected / "item.pt", actual / "item.pt"
                 # 只有参考和候选都发布当前结果，才进行配对比较。
