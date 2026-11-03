@@ -25,8 +25,7 @@ class TurnLog:
             "finished_at": None,
             "content": None,
             "generation": None,
-            "tool_call": None,
-            "tool_response": None,
+            "tool_calls": [],
         }
         self.save()
 
@@ -42,19 +41,37 @@ class TurnLog:
         self.save()
 
     def call(self, ident, name, arguments):
-        """输入调用 ID、名称、参数；在执行前保存调用，返回 None。"""
-        self.record["tool_call"] = {"id": ident, "name": name, "arguments": arguments}
+        """输入调用 ID、名称、参数；依序登记全部调用，不覆盖前一个调用。"""
+        self.record["tool_calls"].append(
+            {"id": ident, "name": name, "arguments": arguments,
+             "status": "pending", "response": None}
+        )
+        self.save()
+
+    def begin(self, ident):
+        """输入已登记的调用 ID；在实际执行前将其标记为 running 并落盘。"""
+        item = next(call for call in self.record["tool_calls"] if call["id"] == ident)
+        item["status"] = "running"
         self.record["status"] = "tool_running"
         self.save()
 
-    def response(self, feedback, returned_text, tokens, truncated):
+    def response(self, feedback, returned_text, tokens, truncated, *, ident=None):
         """输入完整反馈、实际回传文本、token 数及截断标记；保存工具结果，返回 None。"""
-        self.record["tool_response"] = feedback
-        self.record["tool_response_meta"] = {"feedback_tokens": tokens, "truncated": truncated}
+        item = (
+            next(call for call in self.record["tool_calls"] if call["id"] == ident)
+            if ident else self.record["tool_calls"][-1]
+        )
+        item["response"] = feedback
+        item["response_meta"] = {"feedback_tokens": tokens, "truncated": truncated}
         # 默认完整反馈只存一份；发生截断时，另存模型实际看到的前缀，便于复核。
         if truncated:
-            self.record["tool_response_meta"]["returned_text"] = returned_text
-        self.record["status"] = "completed"
+            item["response_meta"]["returned_text"] = returned_text
+        item["status"] = "completed"
+        self.record["status"] = (
+            "completed" if all(call["status"] == "completed" for call in self.record["tool_calls"])
+            else "tool_running"
+        )
+        self.save()
 
     def finish(self):
         """无输入；标记本轮收尾时间并保存，返回 None；不把失败改写为成功。"""
@@ -63,7 +80,7 @@ class TurnLog:
 
 
 def turn_counts(directory):
-    """输入轨迹目录；返回已完成生成/工具返回数，兼容旧格式且按轮号去重。"""
+    """输入轨迹目录；按生成轮次/调用 ID 计数，兼容旧日志且不重复统计。"""
     directory = Path(directory)
     generations = {
         path.stem.removeprefix("generation-") for path in directory.glob("generation-*.json")
@@ -82,4 +99,7 @@ def turn_counts(directory):
             generations.add(ident)
         if record.get("tool_call") and record.get("tool_response") is not None:
             tools.add(ident)
+        for index, call in enumerate(record.get("tool_calls", [])):
+            if call.get("response") is not None:
+                tools.add(f"{ident}:{index}")
     return {"completed_generations": len(generations), "completed_tools": len(tools)}

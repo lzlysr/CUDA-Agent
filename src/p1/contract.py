@@ -60,6 +60,7 @@ def audit_contract(directory):
                     "torch.nn.functional",
                     "cuda_extension",
                     "math",
+                    "typing",
                 }:
                     issues.append("forbidden import " + item.name)
                 aliases[item.asname or item.name.split(".")[0]] = (
@@ -72,6 +73,7 @@ def audit_contract(directory):
                 "torch.nn.functional",
                 "cuda_extension",
                 "math",
+                "typing",
             }:
                 issues.append("forbidden from-import " + str(node.module))
             for item in node.names:

@@ -9,13 +9,19 @@ import time
 import uuid
 
 
-def request(action):
+def request(action, arguments=None):
     """输入允许的动作；写入原子请求并等待宿主回复，打印 JSON，返回 0/1。"""
     directory = Path(os.environ["P1_TOOL_RPC"])
     ident = uuid.uuid4().hex
     target = directory / f"request-{ident}.json"
     temporary = target.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"action": action}), encoding="utf-8")
+    payload = {"action": action}
+    if arguments is not None:
+        payload["arguments"] = arguments
+    encoded = json.dumps(payload)
+    if len(encoded.encode("utf-8")) > 4096:
+        raise ValueError("工具请求超过 4096 字节")
+    temporary.write_text(encoded, encoding="utf-8")
     temporary.replace(target)
     reply = directory / f"reply-{ident}.json"
     deadline = time.monotonic() + 1800

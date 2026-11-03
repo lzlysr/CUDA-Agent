@@ -12,10 +12,10 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shutil
 import statistics
 import subprocess
+import threading
 import time
 import traceback
 
@@ -27,6 +27,8 @@ from .helper.baseline_state import (
 from .helper.pilot_parallel import archive_partial_trajectory, gpu_roles
 from .helper.progress import PilotProgress
 from .helper.turn_log import TurnLog
+from .helper.tool_calls import answer_body, parse_calls, parse_single
+from .helper.workspace import workspace_path
 from .evaluation import Evaluator, InfrastructureError
 
 from .tools import TOOLS, WorkspaceTools
@@ -60,21 +62,7 @@ Aim to beat eager and torch.compile by >5%."""
 
 def safe_path(workspace, name, writing=False):
     """输入工作区、相对路径和写标记；返回不逃逸且符合写范围的绝对路径，违规抛错。"""
-    root = Path(workspace).resolve()
-    p = (root / name).resolve()
-    if not p.is_relative_to(root):
-        raise ValueError("path escapes workspace")
-    rel = p.relative_to(root)
-    if writing and not (
-        str(rel) == "model_new.py"
-        or (
-            len(rel.parts) == 2
-            and rel.parts[0] == "kernels"
-            and p.suffix in {".cu", ".cpp", ".h", ".cuh"}
-        )
-    ):
-        raise ValueError("write only model_new.py and kernels/* source files")
-    return p
+    return workspace_path(workspace, name, writing=writing)
 
 
 def write_files(workspace, files):
@@ -95,39 +83,14 @@ def write_files(workspace, files):
 
 
 def parse(text):
-    # 未结束的 thinking 只是生成文本，不解析或执行其中的工具片段。
-    """输入模型原始文本；只解析 thinking 之外的原生工具/JSON，返回 (工具, 参数) 或 None。"""
-    body = text.rsplit("</think>", 1)[-1]
-    if "<think>" in body:
-        return None
-    match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", body, re.S)
-    if match:
-        raw = match.group(1).strip()
-        native = re.search(r"<function=([^>]+)>\s*(.*?)\s*</function>", raw, re.S)
-        if native:
-            args = {}
-            for key, value in re.findall(
-                r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", native.group(2), re.S
-            ):
-                try:
-                    args[key] = json.loads(value)
-                except json.JSONDecodeError:
-                    args[key] = value
-            return native.group(1), args
-        x = json.loads(raw)
-        return x["name"], x.get("arguments", {})
-    body = body.strip()
-    if body.startswith("```"):
-        body = re.sub(r"^```(?:json)?\s*|\s*```$", "", body)
+    """兼容旧的单调用解析入口；多调用必须使用 parse_calls，不能静默只取第一个。"""
     try:
-        x = json.loads(body)
-        if "files" in x:
-            return "write_files", {"files": x["files"]}
-        if "name" in x:
-            return x["name"], x.get("arguments", {})
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+        actions = parse_calls(text)
+    except (ValueError, TypeError, KeyError):
+        return None
+    if len(actions) > 1:
+        raise ValueError("multiple tool calls: use parse_calls")
+    return actions[0] if actions else None
 
 
 def generation_budget(cfg, agent, prompt_tokens):
@@ -175,6 +138,7 @@ class Pilot:
         self.results = []
         self.session = None
         self._search_evals = []
+        self._tool_lock = threading.RLock()
         self.stop_event = None
         self.progress = None
 
@@ -259,16 +223,37 @@ class Pilot:
         """输入题目及 Agent 标记；返回系统合同、上游 SKILL 和接口说明组成的消息列表。"""
         binding = (ROOT / "upstream/CUDA-Agent/agent_workdir/binding.cpp").read_text()
         header = (ROOT / "upstream/CUDA-Agent/agent_workdir/binding_registry.h").read_text()
-        interface = f'\nFixed binding.cpp:\n```cpp\n{binding}\n```\nFixed binding_registry.h:\n```cpp\n{header}\n```\nReference task (read-only):\n```python\n{task["code"]}\n```'
+        interface = (
+            f"\nFixed binding.cpp:\n```cpp\n{binding}\n```\n"
+            f"Fixed binding_registry.h:\n```cpp\n{header}\n```\n"
+            f'Reference task (read-only):\n```python\n{task["code"]}\n```'
+        )
+        skill = (ROOT / "upstream/CUDA-Agent/agent_workdir/SKILL.md").read_text()
+        common = (
+            "Local environment overrides SKILL examples: target sm_80, not sm_90; do not use sudo. "
+            "The supplied binding and model/utils files are read-only. "
+            "These CUDA restrictions and optimization guidelines apply to both modes.\n"
+        ) + skill + interface
         if agent:
-            skill = (ROOT / "upstream/CUDA-Agent/agent_workdir/SKILL.md").read_text()
             user = (
-                f"Use the tools to analyze the original performance first, write files, compile/check, improve, then submit. Up to {self.cfg['max_turns']} interactions within {self.cfg['context_tokens']} tokens. Bash is persistent. Original commands bash utils/compile.sh, python3 -m utils.verification, and python3 -m utils.profiling are available and dispatch jobs to the GPU sandbox. Use python3 -m utils.profiling --reference-only before creating model_new.py, or call profile_reference. Read existing files before editing. Final scoring selects the fastest correct trajectory candidate. Search feedback uses five inputs; hidden results are never provided. No web/network tools.\n"
-                "Local environment overrides SKILL examples: target sm_80, not sm_90; do not use sudo. "
+                "Use the tools to analyze the original performance first, write files, "
+                "compile/check, improve, then submit. "
+                f"Up to {self.cfg['max_turns']} interactions within {self.cfg['context_tokens']} tokens. "
+                "Bash is persistent. Original commands bash utils/compile.sh, "
+                "python3 -m utils.verification, and python3 -m utils.profiling dispatch jobs "
+                "to the GPU sandbox. Before creating model_new.py, use "
+                "python3 -m utils.profiling --reference-only or profile_reference. "
+                "Read existing files before editing. Final scoring selects the fastest correct "
+                "trajectory candidate. Search feedback uses five inputs; hidden results "
+                "are never provided. No web/network tools.\n"
                 "Bash has no GPU; use the provided utils commands for GPU work. "
-                "Fix the reported failure stage before attempting further performance optimization.\n"
-                + skill
-                + interface
+                "For custom GPU tuning, write an auxiliary .py file and use "
+                "python3 -m utils.run tune_kernel.py [args]. "
+                "Scripts reuse compiled extensions when source is unchanged, and never count "
+                "as scored solutions. Background Bash jobs use BashOutput/KillBash. "
+                "Multiple tool calls execute sequentially; submit must be last. "
+                "Fix the reported failure stage before further performance optimization.\n"
+                + common
             )
         else:
             user = (
@@ -279,7 +264,10 @@ class Pilot:
                 'directly under kernels/ are writable; omit binding.cpp, binding_registry.h, model.py, '
                 'utils/, setup.py and other files. Escape source newlines inside JSON strings. '
                 'Do not replace the JSON object with Markdown Python/CUDA code blocks.\n'
-                + interface
+                "The SKILL workflow below is guidance only: this single mode has no tools or feedback. "
+                "Deliver only the allowed candidate files; do not include auxiliary scripts/notebooks. "
+                "Invalid/incomplete JSON is a failed single attempt; no automatic repair or extra generation.\n"
+                + common
             )
         return [{"role": "system", "content": CONTRACT}, {"role": "user", "content": user}]
 
@@ -363,26 +351,34 @@ class Pilot:
             feedback["profiles"] = {key: value[:20] for key, value in feedback["profiles"].items()}
         return feedback
 
-    def tool_action(self, task, workspace, action):
-        """输入固定任务、工作区和动作；派发隔离评测并记录搜索候选，返回反馈摘要。"""
-        if action == "profile_reference":
-            result = self.ev.profile_reference(task)
-        elif action == "compile":
-            result = self.ev.compile_only(task, workspace)
-        elif action in {"verify", "profile", "evaluate"}:
-            result = self.ev.evaluate(task, workspace, measure=action != "verify")
-            self._search_evals.append(result)
-        else:
-            raise ValueError("unsupported evaluation action")
-        return self.feedback(result)
+    def tool_action(self, task, workspace, action, arguments=None):
+        """输入动作和参数；串行处理前台/后台 GPU 作业，避免同一轨迹污染评测状态。"""
+        with self._tool_lock:
+            if action == "run_script":
+                return self.ev.run_script(task, workspace, **(arguments or {}))
+            if action == "profile_reference":
+                result = self.ev.profile_reference(task)
+            elif action == "compile":
+                result = self.ev.compile_only(task, workspace)
+            elif action in {"verify", "profile", "evaluate"}:
+                result = self.ev.evaluate(task, workspace, measure=action != "verify")
+                self._search_evals.append(result)
+            else:
+                raise ValueError("unsupported evaluation action")
+            return self.feedback(result)
 
-    def shell(self, task, workspace, command):
-        """输入当前任务、工作区和命令；复用该轨迹的 CPU Bash，会话状态持续保留。"""
+    def get_session(self, task, workspace):
+        """输入当前任务及工作区；惰性创建该轨迹的持久终端，返回会话对象。"""
         if self.session is None:
             self.session = SandboxSession(
-                self.cfg, workspace, lambda action: self.tool_action(task, workspace, action)
+                self.cfg, workspace,
+                lambda action, arguments=None: self.tool_action(task, workspace, action, arguments),
             )
-        return self.session.run(command)
+        return self.session
+
+    def shell(self, task, workspace, command, timeout=None):
+        """输入命令与可选秒数；复用持久 CPU Bash，返回该命令输出和返回码。"""
+        return self.get_session(task, workspace).run(command, timeout)
 
     def trajectory(self, task, mode, index):
         """输入题目、模式及稳定序号；运行一条轨迹，返回结果；无论成功失败均清理会话。"""
@@ -407,8 +403,11 @@ class Pilot:
         shutil.copytree(ROOT / "src/p1/agent_utils", work / "utils", dirs_exist_ok=True)
         toolbox = WorkspaceTools(
             work,
-            lambda command: self.shell(task, work, command),
+            lambda command, timeout=None: self.shell(task, work, command, timeout),
             lambda action: self.tool_action(task, work, action),
+            background=lambda command, timeout: self.get_session(task, work).start_background(command, timeout),
+            bash_output=lambda ident: self.get_session(task, work).background_output(ident),
+            kill_bash=lambda ident: self.get_session(task, work).kill_background(ident),
         )
         messages = self.prompt(task, mode == "agent")
         tokens = 0
@@ -427,6 +426,8 @@ class Pilot:
             ):
                 termination = "time_limit"
                 break
+            if self.session is not None:
+                self.session.check()
             turn_log = TurnLog(out, turn, mode)
             try:
                 g = self.generate(
@@ -441,32 +442,37 @@ class Pilot:
                     termination = g.get("stop_reason") or "empty_generation"
                     turn_log.record["status"] = termination
                     break
-                try:
-                    action = parse(g["text"])
-                except Exception as error:
-                    action = None
-                    turn_log.record["parse_error"] = str(error)
-
+                # single 严格交付：解析失败直接结束，不补括号、不重新生成。
                 if mode == "single":
-                    if action and action[0] == "write_files":
+                    try:
+                        files = parse_single(g["text"])
+                    except (ValueError, TypeError, KeyError) as error:
+                        termination = (
+                            "generation_limit" if g.get("finish_reason") == "length"
+                            else "invalid_output_format"
+                        )
+                        turn_log.record["parse_error"] = str(error)
+                    else:
                         try:
-                            written = write_files(work, action[1]["files"])
+                            written = write_files(work, files)
                             turn_log.record["artifact_result"] = written
                             termination = "single_generated"
                         except Exception as error:
                             termination = "invalid_artifacts"
                             turn_log.record["error"] = str(error)
                             events.append({"error": str(error)})
-                    else:
-                        termination = (
-                            "generation_limit"
-                            if g.get("finish_reason") == "length"
-                            else "invalid_output_format"
-                        )
                     turn_log.record["status"] = termination
                     break
 
-                if action is None:
+                try:
+                    actions = parse_calls(g["text"])
+                    if any(name == "submit" for name, _ in actions[:-1]):
+                        raise ValueError("submit must be the last tool call in an answer")
+                except (ValueError, TypeError, KeyError) as error:
+                    actions = []
+                    turn_log.record["parse_error"] = str(error)
+
+                if not actions:
                     # 无合法调用时，保留原文和解析结果，再给模型明确的格式修复提示。
                     messages.append(
                         {
@@ -479,68 +485,64 @@ class Pilot:
                         }
                     )
                     repair = (
-                        "No valid tool call was found. Call one of the provided tools using "
+                        "The entire call batch was not executed because its format is invalid. "
+                        + turn_log.record.get("parse_error", "No valid tool call was found.") + " "
+                        "Call one of the provided tools using "
                         "its native function/parameter format. Use Edit/MultiEdit for focused "
                         "patches instead of repeating complete files."
                     )
-                    messages.append({"role": "tool", "content": repair})
+                    messages.append({"role": "user", "content": repair})
                     turn_log.record.update(
                         status="invalid_tool_call",
-                        tool_response={"error": "invalid_tool_call", "message": repair},
+                        format_error=repair,
                     )
                     events.append({"turn": turn, "error": "invalid_tool_call"})
                     continue
 
-                name, args = action
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                tool_count += 1
-                tool_id = f"p1-{index}-{turn}"
-                turn_log.call(tool_id, name, args)
-                # 日志保留模型完整原文；后续上下文继续使用原生工具消息结构。
-                content = g["text"].split("<tool_call>")[0]
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": [
-                            {
-                                "id": tool_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": args},
-                            }
-                        ],
-                    }
-                )
-                if name == "submit":
-                    # submit 由控制器消费，不向已经结束的模型伪造一条工具返回。
-                    termination = "submitted"
-                    turn_log.record["status"] = termination
+                # 一轮可含多个调用。先完整登记，再逐个执行并按 ID 返回，绝不静默丢弃。
+                calls = []
+                for call_index, (name, args) in enumerate(actions):
+                    ident = f"p1-{index}-{turn}-{call_index}"
+                    calls.append({"id": ident, "type": "function",
+                                  "function": {"name": name, "arguments": args}})
+                    turn_log.call(ident, name, args)
+                body = answer_body(g["text"])
+                thought = g["text"].rsplit("</think>", 1)[0] if "</think>" in g["text"] else ""
+                messages.append({
+                    "role": "assistant", "content": body.split("<tool_call>", 1)[0],
+                    "reasoning_content": thought.removeprefix("<think>"), "tool_calls": calls,
+                })
+                for call in calls:
+                    if self.stop_event is not None and self.stop_event.is_set():
+                        raise InterruptedError("停止本轮剩余调用，保留尚未执行的请求")
+                    ident = call["id"]
+                    name = call["function"]["name"]
+                    args = call["function"]["arguments"]
+                    turn_log.begin(ident)
+                    tool_count += 1
+                    if name == "submit":
+                        feedback = {"status": "submitted"}
+                        termination = "submitted"
+                    else:
+                        try:
+                            feedback = toolbox.dispatch(name, args)
+                        except InfrastructureError:
+                            raise
+                        except Exception as error:
+                            feedback = {"error_type": type(error).__name__, "error": str(error)}
+                    raw = json.dumps(feedback, ensure_ascii=False)
+                    ids = self.tokenizer.encode(raw, add_special_tokens=False)
+                    feedback_limit = self.cfg.get("tool_feedback_tokens")
+                    was_truncated = feedback_limit is not None and len(ids) > feedback_limit
+                    returned_text = self.tokenizer.decode(ids[:feedback_limit]) if was_truncated else raw
+                    turn_log.response(feedback, returned_text, len(ids), was_truncated, ident=ident)
+                    messages.append({"role": "tool", "tool_call_id": ident,
+                                     "name": name, "content": returned_text})
+                    events.append({"turn": turn, "tool": name, "tool_call_id": ident,
+                                   "elapsed": time.monotonic() - started})
+                if termination == "submitted":
+                    turn_log.record["status"] = "submitted"
                     break
-                try:
-                    feedback = toolbox.dispatch(name, args)
-                except InfrastructureError:
-                    raise
-                except Exception as error:
-                    feedback = {"error_type": type(error).__name__, "error": str(error)}
-                raw = json.dumps(feedback, ensure_ascii=False)
-                ids = self.tokenizer.encode(raw, add_special_tokens=False)
-                feedback_limit = self.cfg.get("tool_feedback_tokens")
-                was_truncated = feedback_limit is not None and len(ids) > feedback_limit
-                returned_text = (
-                    self.tokenizer.decode(ids[:feedback_limit]) if was_truncated else raw
-                )
-                turn_log.response(feedback, returned_text, len(ids), was_truncated)
-                messages.append(
-                    {
-                        "role": "tool", "tool_call_id": tool_id,
-                        "name": name, "content": returned_text,
-                    }
-                )
-                events.append({"turn": turn, "tool": name, "elapsed": time.monotonic() - started})
             except BaseException as error:
                 # 基础设施故障/中断也保存当前轮，不能因没有工具返回而丢失模型输出。
                 turn_log.record.update(
@@ -556,6 +558,11 @@ class Pilot:
                 turn_log.finish()
                 if mode == "agent":
                     dump(out / "messages.json", messages)
+        # 终止剩余后台 CPU 任务，并等已派发 GPU 作业收尾，再冻结最终候选。
+        if self.session is not None:
+            self.session.close()
+            self.session.check()
+            self.session = None
         search_seconds = time.monotonic() - started
         if self.stop_event is not None and self.stop_event.is_set():
             raise InterruptedError("停止后不再启动最终候选及隐藏验收")

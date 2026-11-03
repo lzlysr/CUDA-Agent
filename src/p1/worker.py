@@ -9,6 +9,8 @@ import importlib.util
 import json
 from pathlib import Path
 import random
+import runpy
+import shutil
 import statistics
 import sys
 import time
@@ -310,6 +312,22 @@ def compile_candidate():
         # 追加同目录下的 C++ 实现文件。
         + sorted(Path("/candidate/kernels").glob("*.cpp"))
     )
+    # 扩展构建器按 basename 产生对象文件。同名 root/kernels 源文件需要独立名称，
+    # 只改变隔离 build 中的编译路径，不修改模型生成的内容或正式候选快照。
+    names = [path.name for path in sources]
+    if len(names) != len(set(names)):
+        staged = Path("/build/sources")
+        shutil.copytree("/candidate", staged, dirs_exist_ok=True)
+        staged_sources = []
+        for index, path in enumerate(sources):
+            relative = path.relative_to("/candidate")
+            staged_path = staged / relative
+            if names.count(path.name) > 1:
+                renamed = staged_path.with_name(f"p1_source_{index}_{path.name}")
+                renamed.write_bytes(staged_path.read_bytes())
+                staged_path = renamed
+            staged_sources.append(staged_path)
+        sources = staged_sources
     # 至少要求存在一个 .cu 文件，避免完全没有 CUDA 源码的提交进入编译。
     if not any(p.suffix == ".cu" for p in sources):
         raise ValueError("no CUDA source")
@@ -692,11 +710,35 @@ def stream(cfg, phase, candidate):
     }
 
 
+def run_development_script(script, arguments):
+    """输入冻结脚本相对路径和参数；在本 GPU 容器执行，返回不计分的完成状态。"""
+    if not isinstance(script, str):
+        raise ValueError("missing development script")
+    root = Path("/experiment").resolve()
+    source = (root / script).resolve()
+    if not source.is_relative_to(root) or source.suffix != ".py" or not source.is_file():
+        raise ValueError("script must stay inside /experiment")
+    if not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments):
+        raise ValueError("script arguments must be strings")
+    # import cuda_extension 优先读取控制器构建的 .so；不导入原始参考模型。
+    sys.path[:0] = ["/build", "/candidate", str(source.parent), str(root)]
+    sys.argv = [str(source), *arguments]
+    try:
+        runpy.run_path(str(source), run_name="__main__")
+    except SystemExit as error:
+        if error.code not in {None, 0}:
+            raise RuntimeError(f"development script exited with {error.code}") from error
+    SYNC()
+    return {"scored": False, "action": "run_script", "script": script}
+
+
 def main():
     """读取容器模式和阶段；固定环境并运行 worker，写对应阶段 JSON，返回 0/1。"""
     p = argparse.ArgumentParser()
     p.add_argument("mode")
     p.add_argument("--phase", default="feedback")
+    p.add_argument("--script")
+    p.add_argument("--script-args", default="[]")
     a = p.parse_args()
     cfg = json.loads(Path("/config.json").read_text())
     # 在执行选定模式之前统一 TF32、cuDNN 和线程设置。
@@ -716,6 +758,8 @@ def main():
             "reference_stream": lambda: stream(cfg, a.phase, False),
             # candidate_stream：候选端执行同一案例协议，供宿主配对比较。
             "candidate_stream": lambda: stream(cfg, a.phase, True),
+            # 仅执行开发脚本，不计算 reward、不调用参考实现或隐藏输入。
+            "script": lambda: run_development_script(a.script, json.loads(a.script_args)),
         }[a.mode]()
         result.update(
             status="ok",

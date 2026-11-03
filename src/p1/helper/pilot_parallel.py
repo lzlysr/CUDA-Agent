@@ -147,6 +147,11 @@ class ParallelEvaluator(Evaluator):
         with self.operation():
             return super().evaluate(task, workspace, *args, **kwargs)
 
+    def run_script(self, task, workspace, script, args=None):
+        """输入辅助脚本；编译复用和 GPU 运行期间持有同一份评测卡租约。"""
+        with self.operation():
+            return super().run_script(task, workspace, script, args)
+
     def snapshot(self, workspace):
         """输入工作区；跨进程串行分配 evaluations 编号，返回原快照与审查结果。"""
         with blocking_lock(self.pool.directory / "evaluation-id.lock"):

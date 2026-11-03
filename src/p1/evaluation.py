@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from .data import ROOT, sha
 from .helper.baseline_state import atomic_json as dump
+from .helper.workspace import workspace_path
 
 # 限制宿主 PyTorch 的 CPU 算子线程数，避免外部比较器占用过多 CPU。
 torch.set_num_threads(4)
@@ -170,6 +171,8 @@ class Evaluator:
         self.seconds = 0.0  
         # 该计数器记录本 Evaluator 实例发起的候选编译尝试，不代表编译成功数。
         self.compiles = 0
+        # 仅供不计分的调参脚本复用本控制器构建的扩展；正式验收仍独立重编译。
+        self._compiled_builds = {}
         # 读取已有评测目录的最大编号，默认 0。 为每次候选快照分配新的编号，避免覆盖已有记录
         self.counter = max(
             (
@@ -208,6 +211,9 @@ class Evaluator:
         build=None,
         phase="feedback",
         timeout=None,
+        experiment=None,
+        script=None,
+        script_args=None,
     ):
         """输入模式、输出目录、只读挂载和超时；在指定编号 GPU 隔离执行，返回状态/日志/耗时。"""
         # 统一输出路径类型，并建立可写的宿主结果目录。
@@ -278,11 +284,13 @@ class Evaluator:
             (inputs, "/inputs"),
             # 独立的扩展构建目录；正确性和性能容器从这里加载新编译的扩展。
             (build, "/build"),
+            # 自定义开发脚本另行冻结，不挂载参考模型、隐藏输入或原始可写工作区。
+            (experiment, "/experiment"),
         ]:
             # None 表示本次模式不需要该目录，因此完全不挂载。
             if p is not None:
                 # 只有 /build 可写，参考源码、候选源码与输入定义都按只读挂载。
-                mounts.append((Path(p), d, "rw" if d == "/build" else "ro"))
+                mounts.append((Path(p), d, "rw" if d == "/build" and mode != "script" else "ro"))
         # 把挂载表逐项转换成 Docker --mount 参数。
         for p, d, perm in mounts:
             c += [
@@ -346,6 +354,8 @@ class Evaluator:
             "--phase",
             phase,
         ]
+        if script is not None:
+            c += ["--script", script, "--script-args", json.dumps(script_args or [])]
         # 参考预检和参考测时各自使用明确的文件名，其余模式维持 result.json。
         result_name = {
             "reference_prepare": "prepare_result.json",
@@ -489,9 +499,10 @@ class Evaluator:
         # 递归检查工作区文件，但不把整个工作区原样复制进评测。
         for path in Path(workspace).rglob("*"):
             # 按文件名允许模型入口和两份固定绑定基础设施，下一项再放行 kernels 源码。
-            allowed = path.name in {"model_new.py", "binding.cpp", "binding_registry.h"}
+            relative = path.relative_to(workspace)
+            allowed = relative.as_posix() in {"model_new.py", "binding.cpp", "binding_registry.h"}
             # |= 表示在已有允许条件上追加：直属父目录名为 kernels，且后缀为以下源码类型。
-            allowed |= path.parent.name == "kernels" and path.suffix in {
+            allowed |= len(relative.parts) == 2 and relative.parts[0] == "kernels" and path.suffix in {
                 # 允许 CUDA 源文件。
                 ".cu",
                 # 允许 C++ 源文件。
@@ -589,11 +600,74 @@ class Evaluator:
                 if binary.is_file():
                     # copy2 复制扩展并尽量保留元数据；正式验收仍会从源码重新编译。
                     shutil.copy2(binary, destination)
+                    self._compiled_builds[result["candidate_hash"]] = build
                     # 只返回工作区相对文件名，不把参考输出或参考状态路径暴露给工具。
                     result["artifact"] = "cuda_extension.so"
         # 无论静态阻断还是编译结果，都为本次提交保存 result.json。
         dump(ev / "result.json", result)
         # 返回工具反馈；这个入口不做数值比较，也不做加速比测量。
+        return result
+
+    def run_script(self, task, workspace, script, args=None):
+        """输入辅助脚本及字符串参数；隔离运行 GPU 调参，返回日志，不产生正式得分。"""
+        source = workspace_path(workspace, script, writing=True, auxiliary=True)
+        relative = source.relative_to(Path(workspace).resolve())
+        if (source.suffix != ".py" or relative.parts[0] in {"utils", "kernels"}
+                or source.name in {"model.py", "model_new.py"}):
+            raise ValueError("run_script requires an auxiliary Python script")
+        if args is None:
+            args = []
+        if (not isinstance(args, list) or len(args) > 100
+                or any(not isinstance(arg, str) or len(arg) > 1024 for arg in args)):
+            raise ValueError("script args must be at most 100 bounded strings")
+        if not source.is_file():
+            raise FileNotFoundError(script)
+        ev, snap, result, issues = self.snapshot(workspace)
+        result.update(action="run_script", scored=False, script=relative.as_posix(),
+                      script_sha256=sha(source.read_bytes()))
+        result.pop("reward", None)
+        result.pop("correct", None)
+        if issues:
+            result.update(status="contract_violation", issues=issues)
+        else:
+            # 冻结辅助 Python 文件，支持调参脚本导入自己的辅助模块；不复制参考模型。
+            experiment = ev / "experiment"
+            experiment.mkdir()
+            for path in Path(workspace).rglob("*.py"):
+                rel = path.relative_to(workspace)
+                if (path.is_symlink() or rel.parts[0] in {"utils", "kernels"}
+                        or path.name in {"model.py", "model_new.py"}):
+                    continue
+                checked = workspace_path(workspace, rel.as_posix())
+                if checked.is_file():
+                    destination = experiment / rel
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(checked.read_bytes())
+            # 源码未变时复用之前由本控制器生成的 build，不信任工作区自带的 .so。
+            build = self._compiled_builds.get(result["candidate_hash"])
+            if build is None or not (build / "cuda_extension.so").is_file():
+                build = ev / "build"
+                build.mkdir()
+                compiled = self.container(
+                    "compile", ev / "compilation", candidate=snap, build=build,
+                    timeout=self.cfg["compile_seconds"],
+                )
+                self.compiles += 1
+                result["compilation"] = compiled
+                if compiled["status"] == "ok":
+                    self._compiled_builds[result["candidate_hash"]] = build
+                else:
+                    result["status"] = "compilation_failed"
+            if "status" not in result:
+                execution = self.container(
+                    "script", ev / "script", candidate=snap, build=build,
+                    experiment=experiment, script=relative.as_posix(), script_args=args,
+                    timeout=self.cfg.get("shell_seconds", 600),
+                )
+                log = ev / "script/worker.log"
+                result.update(status=execution["status"], execution=execution,
+                              output=log.read_text()[-20000:] if log.exists() else "")
+        dump(ev / "result.json", result)
         return result
 
     # 九、逐例外部验算：参考与候选分别计算，把输出写到各自独立的挂载目录。
@@ -740,6 +814,7 @@ class Evaluator:
             result.update(status="compilation_failed")
             dump(ev / "result.json", result)
             return result
+        self._compiled_builds[result["candidate_hash"]] = build
         # 第三道关：反馈与隐藏使用不同案例协议，隐藏还会检查重复调用和输入/权重变化。
         phase = "hidden" if final else "feedback"
         # 两端分别执行，宿主逐例核对输出；ran 是候选 worker 最终返回的状态。
