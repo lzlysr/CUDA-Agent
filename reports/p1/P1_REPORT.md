@@ -1,6 +1,6 @@
 # P1 基线：当前方案与运行说明
 
-更新日期：2026-10-31。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
+更新日期：2026-11-03。服务器项目根目录：`/home/likun/junjxu/CUDA-Agent`。
 
 本文整合当前的数据、模型、工具、评测协议及运行方法。模型正确率、加速比和成本等实际结果，以接下来新建运行目录中的输出为准。
 
@@ -132,7 +132,7 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 
 ### 工具与持久 Shell
 
-`src/p1/tools.py` 提供 Bash、Read/Write、Edit/MultiEdit、Glob/Grep、TodoWrite，以及 evaluate、profile_reference、submit。文件修改实行先读后写，MultiEdit 全部匹配后才一次写入。
+`src/p1/tools.py` 提供 Bash/BashOutput/KillBash、Read/Write、Edit/MultiEdit、Glob/Grep、NotebookEdit、TodoWrite，以及 evaluate、profile_reference、submit。Grep 调用真正的 ripgrep，支持文件类型过滤和上下文行；相对路径与 `/workspace/...` 映射到同一工作区。文件修改实行先读后写，MultiEdit 全部匹配后才一次写入。
 
 每条 Agent 轨迹保留同一个 CPU 开发容器及 Bash 进程，跨调用保持 cwd、export、函数、工作区和 `/tmp`；轨迹之间不共享会话。Shell 超时会关闭该会话。
 
@@ -724,7 +724,7 @@ scripts/p1-run.sh → src/p1/run.py:main
 
 ### 13.3 多卡配置与运行方式
 
-`generation_gpu` 和 `evaluation_gpu` 都支持整数或非空、无重复的非负整数列表。当前配置分别为 `[4,5]` 和 `[6,7]`，应以实际配置文件为准。下面只展示需要编辑的两个 JSON 字段；示例卡号须自行确认可用，两组不能重合：
+`generation_gpu` 和 `evaluation_gpu` 都支持整数或非空、无重复的非负整数列表。当前配置分别为 `[6,7]` 和 `[4,5]`，应以实际配置文件为准。下面只展示需要编辑的两个 JSON 字段；示例卡号须自行确认可用，两组不能重合：
 
 ```json
 {
@@ -807,14 +807,15 @@ agent  ... 3/12 ... pass_rate=66.7%(2/3) speedup_eager=1.60x speedup_compile=1.2
 | started_at、finished_at | 北京时间；未收尾时 finished_at 为 null。进程强制退出时应结合 status 判断完整性。 |
 | content | 完整模型原文，包括可能的思考文本和工具调用文本，不只保存抽取后的代码。 |
 | generation | 原生成结果中除 text 外的 token、生成耗时、停止原因等信息。 |
-| tool_call | 工具 id/name/arguments；无合法调用时为 null。 |
-| tool_response | 完整结构化反馈；没有真实返回时为 null。非法格式轮次保存的是控制器修复提示，不代表执行了工具。 |
-| tool_response_meta | 反馈 token 数和是否截断；发生截断时另存 returned_text，便于核对模型实际看到的文本。 |
+| tool_calls | 本轮按模型输出顺序排列的调用数组；每项含 id/name/arguments/status/response。无调用时为空数组。 |
+| tool_calls[].response | 该调用的完整结构化返回，尚未执行或中断时为 null；不会覆盖同轮其他调用的返回。 |
+| tool_calls[].response_meta | 反馈 token 数及截断标记；截断时另存 returned_text。 |
+| format_error | 非法 Agent 输出的控制器纠错提示；该轮调用批次未执行，不伪造工具返回。 |
 | parse_error、artifact_result、error_type、error | 按需出现，分别记录格式错误、single 写入文件列表和失败原因。 |
 
 生成开始、生成完成、工具执行前和本轮收尾均原子保存，避免工具失败后丢掉已完成的模型原文。single 只生成一次，不执行 Agent 工具，其产物记录在 artifact_result。submit 由控制器消费后结束交互，不伪造工具返回；最终编译/正确性/测时/隐藏验收仍写入 result.json 及 evaluations。上下文耗尽且未调用模型的轮次，也会留下明确停止原因。
 
-以后不再新建 generation-XXX.json、tool-XXX.json；历史文件保持不动。`p1.status` 可读取新旧格式，按轮号去重计数。
+以后不再新建 generation-XXX.json、tool-XXX.json；历史文件保持不动。`p1.status` 兼容历史分离文件和旧的单调用字段；新日志按生成轮次统计生成数，按调用项统计已完成工具数。
 
 ### 14.3 已执行的少量 GPU 验证
 
@@ -854,3 +855,92 @@ bash scripts/p1-run.sh --run runs/p1/pilot-after-fixes
 v3 中注意力 Agent 的模型生成调用累计约 4993 秒、109158 token；BatchNorm Agent 约 4322 秒、97483 token。单条轨迹的大部分时间消耗在长输出和反复修正，不能把整次多卡运行的墙钟时间都算到隐藏验收上。多进程耗时可能重叠，不应直接相加。
 
 完整诊断证据见 .runtime/tmp/p1-hidden-diagnosis-20261031/DIAGNOSIS.md。此处更新未回填原 run 的通过数，也未启动整组重跑。预算与源码已经变化，现有 --resume 一致性检查会拒绝直接混入旧 run；应在明确恢复方案后处理，不要手动改旧 manifest 来绕过检查。
+
+
+## 16. 2026-11-02 工具接口对齐与严格 single 交付
+
+本次依据论文附录 B 和 v4 轨迹修复接口；模型、数据划分、采样设置、上下文、
+轮数、验收比较数量、TF32、正式测时和最终汇总指标保持原配置。
+格式失败仍是 single 的正式失败，不补括号、不恢复文件、不追加生成，也不改写旧成绩。
+
+### 16.1 一轮多个工具调用
+
+控制器完整解析一轮中的全部 `tool_call`，按顺序执行，每个调用有独立 ID 和返回。
+`turn-XXX.json` 的 `tool_calls` 数组保存该轮所有请求与结果；尚未执行的调用保留
+pending，执行时为 running，有返回时为 completed。中断不会让后续请求从日志中消失。
+多调用批次中 submit 必须放在最后；格式不完整的批次整体不执行，并明确给出错误。
+single 只接受完整的 files JSON，解析失败直接记录失败，不使用 Agent 的格式重试流程。
+
+### 16.2 同一工作区、相同 CUDA 规范
+
+Read/Write/Edit/MultiEdit/Glob/Grep/NotebookEdit 统一识别相对路径、`/workspace/...`
+和当前宿主工作区路径，并在解析链接后检查边界。固定 model.py、SKILL、绑定和 utils
+继续受保护。Agent 可创建辅助 Python 脚本与 notebook；正式候选快照只包含根目录
+ModelNew/固定绑定和 kernels 的直接源码，不复制辅助开发文件或工作区二进制。
+
+single 与 agent 均获得完整官方 SKILL、固定绑定与本地 CUDA 合同；single 明确没有
+工具、执行反馈或追加机会，SKILL 中的交互步骤仅作开发规范参考，最终只交付候选源码。
+
+### 16.3 补齐开发工具
+
+| 工具 | 行为 |
+|---|---|
+| Bash | 复用持久 CPU shell；支持 run_in_background 和不超过 shell_seconds 的命令 timeout。 |
+| BashOutput | 按 bash_id 增量读取新输出，返回运行状态、退出码及 has_more，不重复返回已读内容。 |
+| KillBash | 终止该 CPU 容器内对应任务进程组；已派发的 GPU 作业按原预算收尾，不向宿主 PID 发信号。 |
+| Read | 可用 offset/limit 读取指定行；默认仍返回完整文件。 |
+| Grep | 真正的 ripgrep 正则，支持 glob/type/context/ignore_case/multiline，以及内容、文件名、计数输出。 |
+| NotebookEdit | 支持插入、替换和删除单元；遵守先读后写，不执行单元，修改后清除失效的执行输出。 |
+
+后台 utils 请求由持续 RPC 调度处理，前台与后台 GPU 作业在同一轨迹内串行化；
+多生成进程之间仍通过评测卡池租约协调。轨迹结束时清理后台 CPU 任务，等待已经派发
+的 GPU 作业收尾，再进行最终候选验收。
+
+Grep 使用 kernel Conda 环境中的 `bin/rg`，固定 pip 包为 `ripgrep==14.1.0`。
+该版提供兼容宿主与 Ubuntu 22.04 容器的 Linux wheel；PyPI 无 14.1.1，15.x 的
+Linux wheel 要求 glibc 2.39，故不直接采用。宿主通过绝对路径调用；Docker 已经
+只读挂载整个 kernel 环境，其 PATH 包含环境 bin，无需额外挂载 rg 或修改镜像。
+
+`reports/p0/requirements.txt` 包含正式条目 `ripgrep==14.1.0`，执行
+`python -m pip install -r reports/p0/requirements.txt` 会自动将其安装到当前 Python
+所属环境。整份清单仍用于 learner；不要用它覆盖 kernel 的独立 Torch/CUDA 依赖。
+kernel 仅补充同一个工具包：
+
+```bash
+# 在 kernel Conda 环境中安装固定版本的 rg；该包无额外 Python 运行依赖。
+.runtime/conda/kernel/bin/python -m pip install ripgrep==14.1.0
+```
+
+当前环境统一使用 pip 发行包；已移除旧 Conda ripgrep 包，避免两个包管理器覆盖同一 bin/rg。
+
+### 16.4 GPU 调参脚本
+
+依据：原论文附录 B.2 的 `Step 3 → 3.2 Parameter Tuning (Last Resort)`
+（PDF 第 17–18 页），以及官方 `agent_workdir/SKILL.md` 同名段落，均给出
+`tune_kernel.py`：遍历 config，预热、同步、计时，然后将最佳 config 写回模型。
+官方建议在算法优化已用尽且接近目标（within 1.2x）时才使用这种调参。
+因此 GPU 参数调优能力有原始依据；`utils.run`、run_script RPC 和隔离执行机制
+是本地新增入口，官方没有公开这几个同名接口，不能称为官方原样实现。
+
+Agent 工作区中可以先通过 Write 写入 `tune_kernel.py`，然后在 Bash 执行：
+
+```bash
+# 在当前允许的评测卡上隔离执行脚本；--config 是传给示例脚本的参数，不是固定工具选项。
+python3 -m utils.run tune_kernel.py --config 0
+```
+
+控制器冻结候选源码和辅助脚本，在无网络的 GPU 容器中执行；不挂载参考模型或隐藏输入。
+源码未变时可以复用本控制器已编译的扩展，不信任工作区现成的 .so。脚本调用可自建输入、
+对比运行时配置并打印结果；输出仅作开发反馈，明确 scored=false，不进入搜索候选列表，
+不产生正式正确率、reward 或加速比。选好配置后仍需修改 ModelNew 并执行正式验证/测时。
+
+### 16.5 编译兼容与运行边界
+
+root 和 kernels 中同名 CUDA/C++ 源文件会在隔离 build 中使用不同编译文件名，
+保留源内容及候选哈希，避免 binding.o 等对象名冲突；不人工修正模型的 CUDA 算法。
+静态导入允许 typing 类型注释，实际 PyTorch 计算回退仍按原合同拒绝。
+
+本次仅做源码语法、Shell 语法、引用与差异检查；按用户要求没有运行 CPU 回归，
+没有启动新的模型/GPU 实验。旧 v4 保持原结果。由于源码/提示词/日志结构已变，下一次
+p1-run 需要使用新目录；现有源码指纹保护会拒绝把新代码混入旧运行的 --resume。
+未公开的采样设置不作推测性调整，也不新增格式/编译/正确/性能分阶段汇总指标。

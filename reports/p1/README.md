@@ -103,10 +103,32 @@ PYTHONPATH=src python -B tests/p1/sandbox_smoke.py
 
 ## 逐轮日志与本次修复
 
-新运行每轮只保存 `turn-XXX.json`，包含 `content`、`generation`、`tool_call`、`tool_response` 和状态/北京时间；无合法调用或 submit 时不伪造工具执行。旧日志不迁移，status 兼容两种格式。
+新运行每轮只保存 `turn-XXX.json`，包含 `content`、`generation`、有序 `tool_calls` 数组和状态/北京时间；每个调用单独保存 ID、参数及 response。submit 的返回仅表示控制器收到提交，不代表 GPU 验证成功；非法格式不伪造工具执行。旧日志不迁移，status 兼容历史格式。
 
 kernel 环境补充依赖统一记录在 `reports/p0/requirements.txt` 的相关条目及说明中。参考缺依赖会明确报基础设施错误；权重快照保持 `weights_only=True`，构造参数按可信参考和固定种子重建。完整说明、GPU 验证边界与仍未解决的模型代码问题见报告第 14 节。
 
 ## 隐藏验收预算
 
 当前每个初始化使用 5 个隐藏基础输入，两组共执行 34 次比较。反馈阶段总预算仍为 evaluation_seconds=120 秒；隐藏阶段独立使用 hidden_evaluation_seconds=600 秒，两端容器及控制器同步切换，控制器另留 5 秒收尾。编译和显式 300 秒的参考预检/测量预算不变。该改动及真实单题诊断证据见 P1_REPORT.md 第 15 节；不自动重跑或修改旧结果。
+
+
+## 2026-11-02 工具接口更新
+
+`reports/p0/requirements.txt` 已包含 `ripgrep==14.1.0`；安装完整 learner 清单时会
+通过 pip 一并安装，无需再执行单独的 Conda 安装命令。kernel 环境仅补充此工具：
+
+```bash
+# 将 rg 安装到 kernel Conda 环境，供宿主 Grep 与 Docker 共用。
+.runtime/conda/kernel/bin/python -m pip install ripgrep==14.1.0
+```
+
+不再由 Conda 包管理器安装同名 ripgrep；环境目录和 Docker 挂载方式不变。
+
+支持同轮多个工具调用、/workspace 路径、后台 Bash/BashOutput/KillBash、NotebookEdit、
+ripgrep 类型/上下文检索，以及 `python3 -m utils.run tune_kernel.py [args]` 隔离 GPU 调参。
+参数调优示例来自论文附录 B.2 / 官方 SKILL 的 Parameter Tuning；utils.run 是本地隔离执行入口。
+调参脚本不计分，正式验收仍独立执行。single 严格解析一次完整 files JSON，格式失败即失败，
+不补括号或追加生成。采样配置和汇总指标未改。
+
+源码变化后请使用新的 p1-run 目录，不向旧 v4 结果混入新实现。完整行为见 P1_REPORT.md 第 16 节。
+本次未运行 CPU 回归或新的 GPU 实验。
