@@ -5,6 +5,7 @@
 不要在宿主直接运行；CPU 单测只导入纯辅助函数，不调用 GPU。"""
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 from pathlib import Path
@@ -588,6 +589,16 @@ def perturb(inp):
 # cfg 提供种子，phase 指定反馈/隐藏阶段，candidate 指定参考/候选；返回输出次数和状态。
 def stream(cfg, phase, candidate):
     """输入配置、阶段和参考/候选标记；逐例输出并等待控制器确认，返回次数及状态变化。"""
+    def progress(stage, case=None):
+        """输入阶段和可选案例 ID；立即打印北京时间诊断行，不参与计时或正确性判定。"""
+        print(json.dumps({
+            "event": "stream_progress",
+            "at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="milliseconds"),
+            "role": "candidate" if candidate else "reference",
+            "phase": phase, "case": case, "stage": stage,
+        }), flush=True)
+
+    progress("load_input_spec")
     # 加载可信 get_inputs 定义，参考和候选都从这里重建测试输入。
     inpmod = load("/inputs/model.py", "input_spec")
     if candidate:
@@ -621,9 +632,11 @@ def stream(cfg, phase, candidate):
         # 先写临时文件，避免宿主读到尚未写完的序列化内容。
         tmp = Path("/outputs/item.tmp")
         # 输出先转 CPU，再与案例 ID 一起序列化；参考和候选各有独立的输出挂载目录。
+        progress("serialize_output", label)
         SAVE({"id": label, "output": cpu(value)}, tmp)
         # 在同一目录原子替换为 item.pt，表示这份输出已写完、可以读取。
         tmp.replace(target)
+        progress("waiting_for_ack", label)
         # 只有外部比较器删除文件后才算确认，避免候选自行声称比较通过。
         # 文件还存在就继续等待；只有宿主消费后删除它，worker 才发布下一例。
         while target.exists():
@@ -631,6 +644,7 @@ def stream(cfg, phase, candidate):
             time.sleep(0.01)
         # 外部确认本例已消费后再累加计数；数值是否通过由外部比较器单独记录。
         count += 1
+        progress("acknowledged", label)
         # 在本次执行之后检查 TF32 状态是否仍符合统一设置。
         if flags() != before:
             # 保存发生状态变更的案例标签，交给宿主决定该候选是否合格。
@@ -642,6 +656,7 @@ def stream(cfg, phase, candidate):
     for case in cases:
         # 取得当前案例对应的参数初始化种子。
         s = case["init_seed"]
+        progress("prepare_case", case["id"])
         # 首次遇到该种子时，才创建并恢复对应模型实例。
         if s not in models:
             models[s] = load_model(mod, klass, s, inpmod)
@@ -649,6 +664,7 @@ def stream(cfg, phase, candidate):
         m = models[s]
         # 按本例输入种子调用可信 get_inputs，重建 GPU 输入。
         inp = inputs_for(inpmod, case["input_seed"])
+        progress("inference", case["id"])
         # 执行该案例的正常模型调用。
         out = call(m, inp)
         # 发布普通输出，等待外部逐例比较。
@@ -658,6 +674,7 @@ def stream(cfg, phase, candidate):
         # 只有隐藏验收阶段追加重复执行和原地址改输入检查。
         if phase == "hidden":
             # 对同一模型实例和同一输入再次调用，检查重复调用结果。
+            progress("inference", case["id"] + "-repeat")
             repeated = call(m, inp)
             # 用 -repeat 后缀区分这条比较记录。
             emit(case["id"] + "-repeat", repeated)
@@ -665,6 +682,7 @@ def stream(cfg, phase, candidate):
             # 在已有输入张量地址上修改浮点内容。
             perturb(inp)
             # 对改过内容的输入重新调用模型。
+            progress("inference", case["id"] + "-changed")
             changed = call(m, inp)
             # 用 -changed 后缀发布结果，外部参考端也执行相同变换并给出对应输出。
             emit(case["id"] + "-changed", changed)
@@ -680,6 +698,7 @@ def stream(cfg, phase, candidate):
             m = models[case["init_seed"]]
             # 根据案例种子重新生成原始输入，避免复用刚被 perturb 改过的输入。
             inp = inputs_for(inpmod, case["input_seed"])
+            progress("inference", case["id"] + "-reordered")
             out = call(m, inp)
             # 用 -reordered 后缀发布乱序执行的结果。
             emit(case["id"] + "-reordered", out)
@@ -694,6 +713,7 @@ def stream(cfg, phase, candidate):
             # 重建与当前参数检查对应的输入。
             inp = inputs_for(inpmod, case["input_seed"])
             # 运行重新加载参数后的模型。
+            progress("inference", case["id"] + "-reloaded")
             out = call(m, inp)
             # 用 -reloaded 后缀发布结果，与外部参考输出对应。
             emit(case["id"] + "-reloaded", out)

@@ -22,6 +22,10 @@ from .data import ROOT, dump
 from .helper.baseline_state import beijing_now
 
 
+class ShellSessionClosed(RuntimeError):
+    """CPU 会话不可继续；结束当前轨迹，不作为整组 GPU 基础设施故障。"""
+
+
 class BashProcess:
     """对已有 Bash 进程执行命令；会话状态不因工具调用结束而重置。"""
 
@@ -30,6 +34,7 @@ class BashProcess:
         self.process = process
         self.lines = queue.Queue()
         self.lock = threading.RLock()
+        self.current = None
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
 
@@ -41,47 +46,79 @@ class BashProcess:
         finally:
             self.lines.put(None)
 
-    def run(self, command, timeout=600, poll=None):
-        """输入命令、秒数与可选调度回调；返回 returncode/output，不启动新 Bash。"""
+    def run(self, command, timeout=600, poll=None, *, keep_running=False):
+        """输入命令、等待秒数及续查标记；返回输出/状态，仍使用同一个 Bash。"""
         # 同一条持久 shell 的输入和标记读取必须串行，后台任务另行重定向输出。
         with self.lock:
-            return self._run(command, timeout, poll)
+            return self._run(command, timeout, poll, keep_running)
 
-    def _run(self, command, timeout, poll):
+    def _run(self, command, timeout, poll, keep_running):
         """输入已锁定的命令；执行前后标记协议，返回该命令自身的输出。"""
         marker = "P1_" + uuid.uuid4().hex
+        if self.current is not None and not self.current["completed"]:
+            raise RuntimeError("Bash 正在执行已有命令，请先查询其 bash_id")
         encoded = base64.b64encode(command.encode()).decode()
         # eval 在既有 shell 内执行，避免 bash -c 子进程丢失 cwd/export/函数。
         script = f"builtin printf '\\n{marker}_BEGIN\\n'\neval \"$(printf '%s' '{encoded}' | base64 -d)\"\n"
         script += f"__p1_status=$?\nbuiltin printf '\\n{marker}_END:%s\\n' \"$__p1_status\"\n"
         if self.process.poll() is not None:
-            raise RuntimeError("Bash 会话已经退出；不自动创建丢失状态的新会话")
+            raise ShellSessionClosed("Bash 会话已经退出；不自动创建丢失状态的新会话")
+        self.current = {
+            "id": marker, "started": time.monotonic(),
+            "seen_begin": False, "completed": False, "returncode": None,
+        }
         self.process.stdin.write(script)
         self.process.stdin.flush()
+        return self._collect(timeout, poll, keep_running)
+
+    def resume(self, timeout=0, poll=None):
+        """输入本次等待秒数；读取已有命令的新输出，不重发命令、不改变会话。"""
+        with self.lock:
+            if self.current is None:
+                raise ValueError("没有可查询的前台命令")
+            return self._collect(timeout, poll, True)
+
+    def _collect(self, timeout, poll, keep_running):
+        """输入等待策略；消费同一命令的标记和输出，超时可返回 running 继续查询。"""
+        current = self.current
+        marker = current["id"]
         deadline = time.monotonic() + timeout
-        started = False
         output = []
-        while time.monotonic() < deadline:
+        ready = max(1, self.lines.qsize())
+        consumed = 0
+        while not current["completed"]:
+            if (timeout == 0 and consumed >= ready) or (timeout > 0 and time.monotonic() >= deadline):
+                break
             if poll is not None:
                 poll()
             try:
-                line = self.lines.get(timeout=0.05)
+                # timeout=0 仍消费当前已到达的全部行，遇到空队列立即返回。
+                line = self.lines.get(timeout=max(0, min(0.05, deadline - time.monotonic())))
             except queue.Empty:
+                if time.monotonic() >= deadline:
+                    break
                 continue
             if line is None:
-                raise RuntimeError("Bash 提前退出：" + "".join(output)[-2000:])
+                raise ShellSessionClosed("Bash 提前退出：" + "".join(output)[-2000:])
+            consumed += 1
             if line.strip() == marker + "_BEGIN":
-                started = True
+                current["seen_begin"] = True
                 continue
             if line.startswith(marker + "_END:"):
-                return {
-                    "returncode": int(line.split(":", 1)[1]),
-                    "output": "".join(output)[-20000:],
-                }
-            if started:
+                current["returncode"] = int(line.split(":", 1)[1])
+                current["completed"] = True
+                break
+            if current["seen_begin"]:
                 output.append(line)
-        self.close()
-        raise TimeoutError("Bash 命令超时，会话已关闭，避免后台命令污染下一次调用")
+        if not current["completed"] and not keep_running:
+            self.close()
+            raise ShellSessionClosed("Bash 命令超过硬等待上限，会话已关闭")
+        return {
+            "bash_id": marker,
+            "status": "completed" if current["completed"] else "running",
+            "returncode": current["returncode"],
+            "output": "".join(output)[-20000:],
+        }
 
     def close(self):
         """无参数；关闭终端进程及管道，重复调用安全，无返回值。"""
@@ -111,6 +148,11 @@ class SandboxSession:
         (self.rpc / "jobs").mkdir(exist_ok=True)
         self.jobs = {}
         self.jobs_lock = threading.RLock()
+        # 超时续查的前台命令仍在父 Bash 内执行，不能改成会丢失状态的子 shell。
+        self.foreground_jobs = {}
+        self.foreground_id = None
+        self.foreground_lock = threading.RLock()
+        self.shell_error = None
         self.rpc_lock = threading.Lock()
         self.stop = threading.Event()
         self.rpc_error = None
@@ -229,25 +271,88 @@ class SandboxSession:
         try:
             while not self.stop.wait(0.05):
                 self.poll_requests()
+                self._check_foreground_deadline()
                 with self.jobs_lock:
                     expired = [ident for ident, job in self.jobs.items()
                                if self.job_returncode(ident) is None
                                and time.monotonic() - job["started"] >= job["timeout"]]
                 for ident in expired:
                     self.kill_background(ident, reason="timeout")
+        except ShellSessionClosed as error:
+            self.shell_error = error
         except BaseException as error:
             self.rpc_error = error
 
-    def check(self):
+    def check(self, *, shell=True):
         """无输入；将后台调度异常重新抛给控制器，避免把基础设施故障算模型失败。"""
         if self.rpc_error is not None:
             from .evaluation import InfrastructureError
             if isinstance(self.rpc_error, InfrastructureError):
                 raise self.rpc_error
             raise InfrastructureError("后台工具调度失败：" + str(self.rpc_error)) from self.rpc_error
+        if shell:
+            self._check_foreground_deadline()
+            if self.shell_error is not None:
+                raise self.shell_error
+
+    def _poll_foreground(self, ident, *, consume=True):
+        """输入前台任务 ID 和消费标记；返回新增输出及状态，不再次执行命令。"""
+        with self.foreground_lock:
+            job = self.foreground_jobs[ident]
+            if ident == self.foreground_id:
+                try:
+                    result = self.bash.resume()
+                except ShellSessionClosed as error:
+                    self.shell_error = error
+                    self.foreground_id = None
+                    job.update(status="error", returncode=self.bash.process.poll())
+                    raise
+                job["output"] = (job["output"] + result["output"])[-20000:]
+                job.update(status=result["status"], returncode=result["returncode"])
+                if result["status"] == "completed":
+                    self.foreground_id = None
+            response = {
+                "bash_id": ident, "status": job["status"], "returncode": job["returncode"],
+                "output": job["output"], "has_more": False,
+            }
+            if consume:
+                job["output"] = ""
+            return response
+
+    def _check_foreground_deadline(self):
+        """无输入；短等待不关闭会话，只有命令达到 shell_seconds 硬上限才结束会话。"""
+        with self.foreground_lock:
+            ident = self.foreground_id
+            if ident is None or self.shell_error is not None:
+                return
+            job = self.foreground_jobs[ident]
+            if time.monotonic() - job["started"] < self.cfg.get("shell_seconds", 600):
+                return
+            # 先消费已到达的完成标记，避免把已完成但尚未查询的任务误判成超时。
+            self._poll_foreground(ident, consume=False)
+            if self.foreground_id is not None:
+                self.bash.close()
+                job.update(status="timeout", returncode=124)
+                self.foreground_id = None
+                self.shell_error = ShellSessionClosed("Bash 命令达到 shell_seconds 硬上限，结束当前轨迹")
+
+    def _busy_foreground(self):
+        """无输入；已有前台命令未结束时返回 busy 反馈，否则返回 None。"""
+        with self.foreground_lock:
+            if self.foreground_id is None:
+                return None
+            ident = self.foreground_id
+            # 保留新输出给 BashOutput；本次未执行用户刚提交的另一个命令。
+            result = self._poll_foreground(ident, consume=False)
+            if result["status"] == "completed":
+                return None
+            return {
+                "bash_id": ident, "status": "running", "command_started": False,
+                "message": "已有命令仍在同一会话运行；请用 BashOutput 查询，不要重复提交命令。",
+            }
 
     def command_timeout(self, timeout):
-        """输入可选命令上限；返回不超过当前 shell_seconds 预算的正秒数。"""
+        """输入可选等待秒数；返回不超过 shell_seconds 的前台等待时间。"""
         maximum = self.cfg.get("shell_seconds", 600)
         if timeout is None:
             return maximum
@@ -288,9 +393,28 @@ class SandboxSession:
     def run(self, command, timeout=None):
         """输入 Bash 命令；在持久会话执行并派发受限评测请求，返回终端反馈。"""
         self.check()
-        if len(command) > 100000:
-            raise ValueError("命令超过 100000 字符")
-        result = self.bash.run(command, timeout=self.command_timeout(timeout), poll=self.check)
+        if not isinstance(command, str) or len(command) > 100000:
+            raise ValueError("command must be a string of at most 100000 characters")
+        busy = self._busy_foreground()
+        if busy is not None:
+            return busy
+        try:
+            result = self.bash.run(
+                command, timeout=self.command_timeout(timeout), poll=self.check,
+                keep_running=True,
+            )
+        except ShellSessionClosed as error:
+            self.shell_error = error
+            raise
+        if result["status"] == "running":
+            with self.foreground_lock:
+                ident = result["bash_id"]
+                self.foreground_jobs[ident] = {
+                    "started": self.bash.current["started"], "status": "running",
+                    "returncode": None, "output": "",
+                }
+                self.foreground_id = ident
+            result["message"] = "等待时间已到；命令仍在原会话中运行，请用 BashOutput 查询。"
         self.check()
         return result
 
@@ -299,6 +423,9 @@ class SandboxSession:
         self.check()
         if not isinstance(command, str) or len(command) > 100000:
             raise ValueError("invalid Bash command")
+        busy = self._busy_foreground()
+        if busy is not None:
+            return busy
         timeout = self.command_timeout(timeout)
         ident = uuid.uuid4().hex[:12]
         # mkdir 的父目录也通过 O_NOFOLLOW 打开，拒绝模型把 jobs 换成外部链接。
@@ -335,6 +462,8 @@ class SandboxSession:
     def background_output(self, ident):
         """输入本会话任务 ID；返回上次读取之后的新输出及当前状态。"""
         self.check()
+        if ident in self.foreground_jobs:
+            return self._poll_foreground(ident)
         with self.jobs_lock:
             if ident not in self.jobs:
                 raise ValueError("unknown bash_id")
@@ -357,6 +486,17 @@ class SandboxSession:
 
     def kill_background(self, ident, reason="killed"):
         """输入任务 ID；只在该容器内终止对应进程组，返回任务状态。"""
+        if ident in self.foreground_jobs:
+            with self.foreground_lock:
+                result = self._poll_foreground(ident)
+                if result["status"] == "completed":
+                    return result
+                # 前台 eval 正在父 Bash 内执行；取消它需明确结束会话，不能暗中重建状态。
+                self.bash.close()
+                self.foreground_jobs[ident].update(status=reason, returncode=143)
+                self.foreground_id = None
+                self.shell_error = ShellSessionClosed("已取消活动前台命令，原 Bash 会话结束")
+                return dict(result, status=reason, returncode=143, session_closed=True)
         with self.jobs_lock:
             if ident not in self.jobs:
                 raise ValueError("unknown bash_id")

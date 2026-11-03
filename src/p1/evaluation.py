@@ -380,11 +380,27 @@ class Evaluator:
             result = (
                 json.loads(result_path.read_text())
                 if result_path.exists()
-                else {"status": "error", "error": p.stdout[-6000:]}
+                else {
+                    "status": "error",
+                    "error_type": "WorkerProcessError",
+                    "error": f"{mode} exited with code {p.returncode}; " + p.stdout[-6000:],
+                }
             )
+            # 即使没有 Python traceback，也保留退出码以识别信号终止或容器启动失败。
+            result["container_returncode"] = p.returncode
         # Docker 命令超时后进入此分支；下方 finally 仍会尝试强制删除容器。
         except subprocess.TimeoutExpired as e:
-            result = {"status": "timeout", "error": f"{mode} exceeded timeout"}
+            # TimeoutExpired 的输出可能仍是 bytes；在删除容器前保存已经捕获的阶段证据。
+            output = e.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            (out / "worker.log").write_text(output[-100000:])
+            result = {
+                "status": "timeout",
+                "error_type": "TimeoutExpired",
+                "error": f"{mode} exceeded timeout",
+                "timeout_seconds": timeout or self.cfg["evaluation_seconds"],
+            }
         # 无论正常、超时还是传播其他异常，都执行容器清理和成本累计。
         finally:
             # --rm 之外的兜底清理：防止客户端退出后 GPU 容器仍留在后台。
@@ -776,6 +792,47 @@ class Evaluator:
         # 返回全部逐例检查与两端执行状态；最终通过条件由 evaluate 统一判断。
         return checks, rr, cr
 
+    def reference_health(self, task, ev, phase):
+        """输入题目、评测目录及阶段；独立确认参考全部输出，返回健康检查状态。
+
+        仅在参考超时且候选也失败时调用。候选容器已清理；这里不运行候选、
+        不作数值通过判定，也不放宽正式候选必须完成的比较数量。
+        """
+        ref = self.run / "references" / task["task_id"]
+        output = ev / "reference-health"
+        output.mkdir()
+        seconds = (
+            self.cfg.get("hidden_evaluation_seconds", self.cfg["evaluation_seconds"])
+            if phase == "hidden" else self.cfg["evaluation_seconds"]
+        )
+        acknowledged = 0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                self.container, "reference_stream", output,
+                reference=ref, inputs=ref / "cases/input-spec",
+                phase=phase, timeout=seconds,
+            )
+            # 可信参考不再等待候选；逐例确认文件，验证其能否独立走完整个协议。
+            while not future.done():
+                item = output / "item.pt"
+                if item.exists():
+                    item.unlink()
+                    acknowledged += 1
+                time.sleep(0.01)
+            result = future.result()
+        expected = (
+            self.cfg["feedback_cases"] if phase == "feedback"
+            else self.cfg["hidden_cases_per_init"] * len(self.cfg["hidden_init_seeds"]) * 3 + 4
+        )
+        result["acknowledged_outputs"] = acknowledged
+        if result["status"] == "ok" and (
+            acknowledged != expected or result.get("comparisons") != expected
+            or result.get("state_mutations")
+        ):
+            result.update(status="error", error="reference health protocol incomplete")
+        dump(output / "result.json", result)
+        return result
+
     # 十、正式候选评测入口，按合同、编译、正确性、性能顺序逐级放行。
     # task 是固定题目，workspace 是待验收源码目录；也可传上一轮冻结快照用于原样重试。
     # final=True 使用隐藏案例，只验正确性；False 使用反馈案例并可测时。
@@ -819,10 +876,24 @@ class Evaluator:
         phase = "hidden" if final else "feedback"
         # 两端分别执行，宿主逐例核对输出；ran 是候选 worker 最终返回的状态。
         checks, reference, ran = self.streamed_checks(task, snap, build, ev, phase)
+        reference_waited_for_candidate = False
+        if reference["status"] == "timeout" and ran["status"] != "ok":
+            # 配对握手会让正常参考等待慢/挂起的候选；不能仅凭同时超时就归咎于参考。
+            health = self.reference_health(task, ev, phase)
+            result["stream_failure"] = {
+                "reference": reference, "candidate": ran,
+                "reference_health": health,
+            }
+            reference_waited_for_candidate = health["status"] == "ok"
+            if reference_waited_for_candidate:
+                result["stream_failure"]["diagnosis"] = "candidate_failed_reference_waiting"
         # 先判断参考是否正常；参考出问题时，尚不能据此判断候选算错。
-        if reference["status"] != "ok":
+        if reference["status"] != "ok" and not reference_waited_for_candidate:
             # 单独保存参考端故障与候选端状态，保留基础设施证据。
-            dump(ev / "infrastructure-error.json", {"reference": reference, "candidate": ran})
+            dump(ev / "infrastructure-error.json", {
+                "reference": reference, "candidate": ran, "checks": checks,
+                "reference_health": result.get("stream_failure", {}).get("reference_health"),
+            })
             # 首次参考故障允许对同一份快照完整重试一次；新调用会生成新的评测目录。
             if attempt == 0:
                 # 重试保留 final 和 measure，不能把隐藏验收或仅正确性检查意外变成其他模式。

@@ -34,12 +34,12 @@ EDIT = {
 TOOLS = [
     schema(
         "Bash",
-        "Run a command in the persistent CPU shell. cwd, variables and functions survive calls. run_in_background=true returns a bash_id for BashOutput/KillBash. For GPU tuning use python3 -m utils.run tune_kernel.py; normal CPU Bash has no GPU.",
+        "Run a command in the persistent CPU shell. cwd, variables and functions survive calls. timeout limits foreground waiting: if still running, use the returned bash_id with BashOutput instead of resubmitting. The shell is busy until that command completes; shell_seconds remains its hard runtime limit. run_in_background=true starts a separate child job. For GPU tuning use python3 -m utils.run tune_kernel.py; normal CPU Bash has no GPU.",
         {"command": STRING, "run_in_background": {"type": "boolean"}, "timeout": {"type": "integer"}},
         ["command"],
     ),
-    schema("BashOutput", "Read only new output from a background job.", {"bash_id": STRING}, ["bash_id"]),
-    schema("KillBash", "Terminate a background job and its process group.", {"bash_id": STRING}, ["bash_id"]),
+    schema("BashOutput", "Read new output and status from a running foreground or background job.", {"bash_id": STRING}, ["bash_id"]),
+    schema("KillBash", "Terminate a job. Cancelling an active foreground job closes the persistent shell and ends this trajectory.", {"bash_id": STRING}, ["bash_id"]),
     schema(
         "Read",
         "Read a workspace UTF-8 file before changing an existing file.",

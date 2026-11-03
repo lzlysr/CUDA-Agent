@@ -32,7 +32,7 @@ from .helper.workspace import workspace_path
 from .evaluation import Evaluator, InfrastructureError
 
 from .tools import TOOLS, WorkspaceTools
-from .sandbox import SandboxSession
+from .sandbox import SandboxSession, ShellSessionClosed
 
 
 CONTRACT = """You optimize PyTorch tasks for NVIDIA A100 sm_80 using CUDA C++.
@@ -220,7 +220,7 @@ class Pilot:
         return result
 
     def prompt(self, task, agent):
-        """输入题目及 Agent 标记；返回系统合同、上游 SKILL 和接口说明组成的消息列表。"""
+        """输入题目及 Agent 标记；返回规则/SKILL 系统消息和题目/交付要求用户消息。"""
         binding = (ROOT / "upstream/CUDA-Agent/agent_workdir/binding.cpp").read_text()
         header = (ROOT / "upstream/CUDA-Agent/agent_workdir/binding_registry.h").read_text()
         interface = (
@@ -229,23 +229,25 @@ class Pilot:
             f'Reference task (read-only):\n```python\n{task["code"]}\n```'
         )
         skill = (ROOT / "upstream/CUDA-Agent/agent_workdir/SKILL.md").read_text()
-        common = (
-            "Local environment overrides SKILL examples: target sm_80, not sm_90; do not use sudo. "
+        # 稳定的开发规则放在系统消息中，官方 SKILL 正文保持原样。
+        # 本地覆盖说明置于 SKILL 之后，明确以实际硬件及沙箱权限为准。
+        system = (
+            CONTRACT
+            + "\n\n## Official CUDA development SKILL\n"
+            + skill
+            + "\n\n## Local environment overrides and runtime rules\n"
+            + "Local environment overrides SKILL examples: target sm_80, not sm_90; do not use sudo. "
             "The supplied binding and model/utils files are read-only. "
             "These CUDA restrictions and optimization guidelines apply to both modes.\n"
-        ) + skill + interface
+        )
         if agent:
-            user = (
-                "Use the tools to analyze the original performance first, write files, "
-                "compile/check, improve, then submit. "
-                f"Up to {self.cfg['max_turns']} interactions within {self.cfg['context_tokens']} tokens. "
+            # 工具的固定使用方式属于运行规范；题目、预算和本次目标留在用户消息。
+            system += (
                 "Bash is persistent. Original commands bash utils/compile.sh, "
                 "python3 -m utils.verification, and python3 -m utils.profiling dispatch jobs "
                 "to the GPU sandbox. Before creating model_new.py, use "
                 "python3 -m utils.profiling --reference-only or profile_reference. "
-                "Read existing files before editing. Final scoring selects the fastest correct "
-                "trajectory candidate. Search feedback uses five inputs; hidden results "
-                "are never provided. No web/network tools.\n"
+                "Read existing files before editing. No web/network tools.\n"
                 "Bash has no GPU; use the provided utils commands for GPU work. "
                 "For custom GPU tuning, write an auxiliary .py file and use "
                 "python3 -m utils.run tune_kernel.py [args]. "
@@ -253,9 +255,21 @@ class Pilot:
                 "as scored solutions. Background Bash jobs use BashOutput/KillBash. "
                 "Multiple tool calls execute sequentially; submit must be last. "
                 "Fix the reported failure stage before further performance optimization.\n"
-                + common
+            )
+            user = (
+                "Use the tools to analyze the original performance first, write files, "
+                "compile/check, improve, then submit. "
+                f"Up to {self.cfg['max_turns']} interactions within {self.cfg['context_tokens']} tokens. "
+                "Final scoring selects the fastest correct trajectory candidate. "
+                "Search feedback uses five inputs; hidden results are never provided.\n"
+                + interface
             )
         else:
+            # 单次生成没有执行工具；在系统层解释 SKILL 的交互步骤，避免角色间冲突。
+            system += (
+                "The SKILL workflow is guidance only for this single mode: "
+                "there are no tools or execution feedback.\n"
+            )
             user = (
                 'Generate one complete solution with no execution feedback. Return only a JSON object '
                 '{"files":{"model_new.py":"...","kernels/kernel.cu":"...","kernels/kernel_binding.cpp":"..."}} '
@@ -264,12 +278,14 @@ class Pilot:
                 'directly under kernels/ are writable; omit binding.cpp, binding_registry.h, model.py, '
                 'utils/, setup.py and other files. Escape source newlines inside JSON strings. '
                 'Do not replace the JSON object with Markdown Python/CUDA code blocks.\n'
-                "The SKILL workflow below is guidance only: this single mode has no tools or feedback. "
                 "Deliver only the allowed candidate files; do not include auxiliary scripts/notebooks. "
                 "Invalid/incomplete JSON is a failed single attempt; no automatic repair or extra generation.\n"
-                + common
+                + interface
             )
-        return [{"role": "system", "content": CONTRACT}, {"role": "user", "content": user}]
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
 
     def feedback(self, result):
         """输入完整评测结果；返回给模型的诊断摘要，完整日志仍保留在评测目录。"""
@@ -427,7 +443,13 @@ class Pilot:
                 termination = "time_limit"
                 break
             if self.session is not None:
-                self.session.check()
+                try:
+                    self.session.check()
+                except ShellSessionClosed as error:
+                    # 会话硬超时或显式取消只结束当前轨迹，避免继续几十轮无效调用。
+                    termination = "shell_session_closed"
+                    events.append({"error_type": type(error).__name__, "error": str(error)})
+                    break
             turn_log = TurnLog(out, turn, mode)
             try:
                 g = self.generate(
@@ -528,6 +550,9 @@ class Pilot:
                             feedback = toolbox.dispatch(name, args)
                         except InfrastructureError:
                             raise
+                        except ShellSessionClosed as error:
+                            feedback = {"error_type": type(error).__name__, "error": str(error)}
+                            termination = "shell_session_closed"
                         except Exception as error:
                             feedback = {"error_type": type(error).__name__, "error": str(error)}
                     raw = json.dumps(feedback, ensure_ascii=False)
@@ -540,8 +565,10 @@ class Pilot:
                                      "name": name, "content": returned_text})
                     events.append({"turn": turn, "tool": name, "tool_call_id": ident,
                                    "elapsed": time.monotonic() - started})
-                if termination == "submitted":
-                    turn_log.record["status"] = "submitted"
+                    if termination == "shell_session_closed":
+                        break
+                if termination in {"submitted", "shell_session_closed"}:
+                    turn_log.record["status"] = termination
                     break
             except BaseException as error:
                 # 基础设施故障/中断也保存当前轮，不能因没有工具返回而丢失模型输出。
@@ -561,7 +588,8 @@ class Pilot:
         # 终止剩余后台 CPU 任务，并等已派发 GPU 作业收尾，再冻结最终候选。
         if self.session is not None:
             self.session.close()
-            self.session.check()
+            # CPU 会话已明确终止时仍要检查 GPU 调度错误，但不再次抛已记录的会话错误。
+            self.session.check(shell=False)
             self.session = None
         search_seconds = time.monotonic() - started
         if self.stop_event is not None and self.stop_event.is_set():
