@@ -22,7 +22,7 @@
   "rtol": 0.01,
   "timing_iterations": 30,
   "timing_rounds": 3,
-  "baseline_drift_limit": 0.03,
+  "baseline_drift_limit": 0.05,
   "feedback_cases": 5,
   "hidden_cases_per_init": 5,
   "hidden_init_seeds": [

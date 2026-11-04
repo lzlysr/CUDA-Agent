@@ -910,6 +910,7 @@ def main(argv=None):
     """输入可选 CLI 参数列表；预览或持目录/卡号锁运行，正常返回 0，安全停止返回 130。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default="runs/p1/pilot-train-v3-seed42")
+    parser.add_argument("--task-id", help="只运行指定 task_id；不修改公共 pilot 题单")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="只读预览，不查询或启动 GPU")
@@ -918,9 +919,23 @@ def main(argv=None):
     generation, evaluation = gpu_roles(cfg)
     output = (ROOT / args.run).resolve()
     validate_resume(cfg, output, args.resume)
+    selected_tasks = None
+    if args.task_id:
+        # 新运行从公共 pilot 中选题；续跑只能确认原题单，不得悄悄删掉其他题。
+        task_path = output / "tasks.json"
+        source_tasks = json.loads(
+            (task_path if task_path.exists() else ROOT / "data/processed/pilot.json").read_text()
+        )
+        selected_tasks = [task for task in source_tasks if task["task_id"] == args.task_id]
+        if len(selected_tasks) != 1:
+            parser.error(f"题单中未找到唯一的 task_id：{args.task_id}")
+        if args.resume and len(source_tasks) != 1:
+            parser.error("--task-id 不能将已有多题运行改为单题；请使用新的 --run 目录")
     if args.dry_run:
         task_path = output / "tasks.json"
-        tasks = json.loads((task_path if task_path.exists() else ROOT / "data/processed/pilot.json").read_text())
+        tasks = selected_tasks if selected_tasks is not None else json.loads(
+            (task_path if task_path.exists() else ROOT / "data/processed/pilot.json").read_text()
+        )
         print(json.dumps({"run": str(output), "resume": args.resume,
                           "prepare_only": args.prepare_only, "task_count": len(tasks),
                           "generation_gpus": generation, "evaluation_gpus": evaluation,
@@ -948,6 +963,10 @@ def main(argv=None):
             previous_signals[signum] = signal.signal(signum, lambda number, frame: stop.set())
         pilot = None
         try:
+            if selected_tasks is not None and not args.resume:
+                # 取得运行锁并完成环境检查后，只在本次 run 中冻结选出的题目。
+                # 串行与多卡入口都会读取这份 tasks.json，公共 pilot.json 保持不变。
+                dump(output / "tasks.json", selected_tasks)
             pilot = Pilot(cfg, output)
             pilot.stop_event = stop
             pilot.execute(args.prepare_only)

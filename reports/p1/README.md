@@ -149,3 +149,16 @@ v4/v5 差异、修复范围及定点验证见 P1_REPORT.md 第 17 节；新实�
 每题参考代码、固定接口和本次交付要求放在 user。Agent 的稳定工具使用规则归入 system，
 single 明确无工具/执行反馈；工具 schema 仍由聊天模板单独传入。详见 P1_REPORT.md 第 18 节。
 该布局是本地实现选择，不代表作者公开了相同的完整提示词；新实验使用新 run 目录。
+
+## 单题运行
+
+p1.run 支持 --task-id，从公共 pilot 题单中精确选取一道题，在本次 run/tasks.json 中冻结；
+不修改 data/processed/pilot.json。示例：只运行 hardsigmoid + ReLU，仍执行 single 和 Agent 两种模式：
+
+    # 按配置中的 GPU、采样和预算运行指定题目；目录必须是新目录。
+    bash scripts/p1-run.sh --run runs/p1/run-pilot-1-v7 --task-id ops6k-9fbe88dcf4053fa4
+    # 只读预览，确认 task_count 为 1；不加载模型、不启动 GPU。
+    bash scripts/p1-run.sh --run runs/p1/run-pilot-1-v7 --task-id ops6k-9fbe88dcf4053fa4 --dry-run
+
+续跑单题目录可直接使用原 --run 加 --resume；显式传 --task-id 时必须与原单题题单一致。
+不能用该参数缩减已有多题运行。仅改变目录名中的数字不会改变实际题目数量。
