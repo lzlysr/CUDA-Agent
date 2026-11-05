@@ -25,6 +25,7 @@ from .helper.baseline_state import (
     exclusive_lock, run_lock_path, guard_active_containers,
 )
 from .helper.pilot_parallel import archive_partial_trajectory, gpu_roles
+from .helper.inference import concurrency
 from .helper.progress import PilotProgress
 from .helper.turn_log import TurnLog
 from .helper.tool_calls import answer_body, parse_calls, parse_single
@@ -133,7 +134,8 @@ class Pilot:
         generation, evaluation = gpu_roles(cfg)
         self.generation_gpu = generation[0] if generation_gpu is None else generation_gpu
         self.ev = evaluator if evaluator is not None else Evaluator(cfg, self.run, gpu=evaluation[0])
-        self.llm = None
+        self.inference = None
+        self._owns_inference = False
         self.tokenizer = None
         self.results = []
         self.session = None
@@ -143,44 +145,36 @@ class Pilot:
         self.progress = None
 
     def model(self):
-        """无参数；在本进程指定编号卡加载完整 BF16 模型及 tokenizer，返回 None。"""
-        if self.llm is not None:
+        """无输入；独立入口创建引擎，多题控制器复用同一卡的共享引擎。"""
+        if self.inference is not None:
             return
+        from .helper.inference import InferenceService
+
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.generation_gpu)
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         os.environ["VLLM_NO_USAGE_STATS"] = "1"
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        from transformers import AutoTokenizer
-        from vllm import LLM
-
-        self.model_started = time.monotonic()
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            ROOT / self.cfg["model"], local_files_only=True
+        self.inference = InferenceService(
+            self.cfg, ROOT, self.generation_gpu, self.run, self.stop_event
         )
-        self.llm = LLM(
-            model=str(ROOT / self.cfg["model"]),
-            dtype="bfloat16",
-            max_model_len=self.cfg["context_tokens"],
-            max_num_seqs=1,
-            gpu_memory_utilization=0.85,
-            enforce_eager=True,
-            enable_prefix_caching=False,
-            limit_mm_per_prompt={"image": 0, "video": 0},
-            seed=self.cfg["seed"],
-        )
+        self._owns_inference = True
+        self.tokenizer = self.inference.tokenizer
+        self.model_started = self.inference.started
 
     def close_model(self):
-        """无输入；退出前关闭本模型的推理引擎并释放引用，不影响其他进程的模型。"""
-        if self.llm is not None:
-            self.llm.llm_engine.engine_core.shutdown()
-            self.llm = None
+        """无输入；只关闭自己创建的引擎，共享引擎由生成卡的主进程统一关闭。"""
+        if self.inference is not None and self._owns_inference:
+            self.inference.close()
+        self.inference = None
         self.tokenizer = None
 
     def generate(self, messages, tools, seed):
         """输入消息、是否启用工具和种子；返回文本与生成统计，由调用方写入统一轮次日志。"""
         from vllm import SamplingParams
+        from vllm.sampling_params import RequestOutputKind
 
         text = self.tokenizer.apply_chat_template(
             messages,
@@ -199,16 +193,17 @@ class Pilot:
                 "text": "",
             }
         start = time.monotonic()
-        res = self.llm.generate(
-            [{"prompt_token_ids": ids}],
+        res = self.inference.generate(
+            ids,
             SamplingParams(
                 temperature=self.cfg["temperature"],
                 top_p=self.cfg["top_p"],
                 max_tokens=capacity,
                 seed=seed,
+                output_kind=RequestOutputKind.FINAL_ONLY,
             ),
-            use_tqdm=False,
-        )[0].outputs[0]
+            label=getattr(self, "request_label", ""),
+        )
         result = {
             "text": res.text,
             "prompt_tokens": len(ids),
@@ -409,6 +404,7 @@ class Pilot:
     def _trajectory(self, task, mode, index):
         """输入固定题目、模式和序号；执行有预算的开发轨迹并隐藏验收，返回完整结果。"""
         started = time.monotonic()
+        self.request_label = f"{task['task_id']}/{mode}"
         out = self.run / "trajectories" / task["task_id"] / mode
         work = out / "workspace"
         work.mkdir(parents=True, exist_ok=True)
@@ -780,7 +776,9 @@ class Pilot:
     def _execute(self, prepare_only=False):
         """输入是否仅预检；保存题单、评测两种模式并汇总，不改变原有数据和预算。"""
         generation, evaluation = gpu_roles(self.cfg)
-        if len(generation) > 1 or len(evaluation) > 1:
+        if (len(generation) > 1 or len(evaluation) > 1
+                or any(concurrency(self.cfg, "generation_concurrency", g) > 1 for g in generation)
+                or any(concurrency(self.cfg, "evaluation_concurrency", g) > 1 for g in evaluation)):
             from .helper.pilot_parallel import execute_parallel
             return execute_parallel(self, prepare_only, self.stop_event)
         task_file = self.run / "tasks.json"
@@ -874,7 +872,10 @@ def validate_resume(cfg, output, resume):
     if saved.get("mode") == "reference_only":
         raise RuntimeError("纯基线目录不能作为 Qwen pilot 续跑，请使用新的运行目录")
     previous = saved["config"]
-    scheduling = {"generation_gpu", "evaluation_gpu"}
+    scheduling = {
+        "generation_gpu", "evaluation_gpu", "generation_concurrency",
+        "evaluation_concurrency", "compile_workers",
+    }
     protocol = lambda value: {key: item for key, item in value.items() if key not in scheduling}
     if protocol(previous) != protocol(cfg):
         raise RuntimeError("模型、预算或评测配置与旧 run 不同，请使用新的运行目录")
@@ -910,7 +911,7 @@ def main(argv=None):
     """输入可选 CLI 参数列表；预览或持目录/卡号锁运行，正常返回 0，安全停止返回 130。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default="runs/p1/pilot-train-v3-seed42")
-    parser.add_argument("--task-id", help="只运行指定 task_id；不修改公共 pilot 题单")
+    parser.add_argument("--task-id", nargs="+", help="运行一个或多个 task_id；不修改公共 pilot 题单")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="只读预览，不查询或启动 GPU")
@@ -921,16 +922,20 @@ def main(argv=None):
     validate_resume(cfg, output, args.resume)
     selected_tasks = None
     if args.task_id:
-        # 新运行从公共 pilot 中选题；续跑只能确认原题单，不得悄悄删掉其他题。
+        # 新运行从公共 pilot 中选题并保留原顺序；续跑只能确认完整冻结题单。
         task_path = output / "tasks.json"
         source_tasks = json.loads(
             (task_path if task_path.exists() else ROOT / "data/processed/pilot.json").read_text()
         )
-        selected_tasks = [task for task in source_tasks if task["task_id"] == args.task_id]
-        if len(selected_tasks) != 1:
-            parser.error(f"题单中未找到唯一的 task_id：{args.task_id}")
-        if args.resume and len(source_tasks) != 1:
-            parser.error("--task-id 不能将已有多题运行改为单题；请使用新的 --run 目录")
+        requested = set(args.task_id)
+        if len(requested) != len(args.task_id):
+            parser.error("--task-id 含重复题号")
+        selected_tasks = [task for task in source_tasks if task["task_id"] in requested]
+        missing = requested - {task["task_id"] for task in selected_tasks}
+        if missing:
+            parser.error(f"题单中未找到 task_id：{sorted(missing)}")
+        if args.resume and len(source_tasks) != len(selected_tasks):
+            parser.error("--task-id 不能缩减已有运行的冻结题单；请使用新的 --run 目录")
     if args.dry_run:
         task_path = output / "tasks.json"
         tasks = selected_tasks if selected_tasks is not None else json.loads(
@@ -939,7 +944,10 @@ def main(argv=None):
         print(json.dumps({"run": str(output), "resume": args.resume,
                           "prepare_only": args.prepare_only, "task_count": len(tasks),
                           "generation_gpus": generation, "evaluation_gpus": evaluation,
-                          "generation_strategy": "one_model_replica_per_gpu"},
+                          "task_ids": [task["task_id"] for task in tasks],
+                          "generation_concurrency": cfg.get("generation_concurrency", 1),
+                          "evaluation_concurrency": cfg.get("evaluation_concurrency", 1),
+                          "generation_strategy": "shared_async_model_per_gpu"},
                          ensure_ascii=False, indent=2))
         return 0
     if shutil.disk_usage(ROOT).free < 80 * 1024**3:

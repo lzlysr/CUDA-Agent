@@ -1,6 +1,6 @@
 # P1 入口
 
-更新日期：2026-10-31。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
+更新日期：2026-11-05。完整方案、环境、工具、评测协议和论文对齐说明统一见 [P1_REPORT.md](P1_REPORT.md)。实际实验结果写入每次独立的 run 目录。新运行的根目录 `results.json` 只保存摘要和 `detail_path`；预检与基线详情分别保存在 `cases/prepare_result.json`、`initial-bench/bench_result.json`，不再生成 `prepare.json` 或 `baseline.json` 副本。
 
 ## 只看 eager/torch.compile
 
@@ -41,7 +41,7 @@ Ctrl+C 或向控制器发 TERM 会停止派新题，等待各卡当前题结束�
 
 ## 运行 Qwen single/agent pilot
 
-当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；当前配置 GPU [4,5] 生成、[6,7] 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，按题并行，评测卡整组租用，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡/长上下文流程已在此前 pilot 执行；当前修复及少量 GPU 验证结果见报告第 14 节。
+当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；当前配置 GPU [0,2] 生成、[3,4] 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，同卡题目共享异步引擎；正确性检查可同卡并发，正式测时独占该卡，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡/长上下文流程已在此前 pilot 执行；当前修复及少量 GPU 验证结果见报告第 14 节。
 
 ```bash
 cd /home/likun/junjxu/CUDA-Agent
@@ -51,7 +51,7 @@ bash scripts/p1-run.sh --run runs/p1/pilot-train-v3 --dry-run
 bash scripts/p1-run.sh --run runs/p1/pilot-train-v3
 ```
 
-已有运行目录需显式 `--resume`；允许更换生成/评测卡号及卡数，其余配置及 manifest 保存的源码指纹须一致；本次修复后应新建 run，不混合新旧结果。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
+已有运行目录需显式 `--resume`；允许更换生成/评测卡号、卡数及并发/编译槽数，其余配置及 manifest 保存的源码指纹须一致；本次修复后应新建 run，不混合新旧结果。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
 
 同一题的 single、agent 及最终隐藏验收全部结束、两条结果保存后，才删除共享的
 `references/<id>/cases/input-spec/`、`compile-cache/`；不删除轨迹、候选源码或结果文件。
@@ -93,7 +93,7 @@ PYTHONPATH=src python -B tests/p1/sandbox_smoke.py
 - `runs`：每次运行的固定题单、配置、原始轨迹、候选快照和结果。
 - `reports`：当前统一报告、入口说明和数据审计。
 
-本次整理没有启动实验或定时任务。完整 test、KernelBench 和 P2 训练不由以上 pilot 命令自动扩展执行。
+本次性能改造已执行定点 GPU 验证，详情见报告第 20 节；没有新增定时任务。完整 test、KernelBench 和 P2 训练不由以上 pilot 命令自动扩展执行。
 
 ## 基线汇总的均值行
 
@@ -152,7 +152,7 @@ single 明确无工具/执行反馈；工具 schema 仍由聊天模板单独传�
 
 ## 单题运行
 
-p1.run 支持 --task-id，从公共 pilot 题单中精确选取一道题，在本次 run/tasks.json 中冻结；
+p1.run 支持 --task-id，从公共 pilot 题单中精确选取一道或多道题，在本次 run/tasks.json 中冻结；
 不修改 data/processed/pilot.json。示例：只运行 hardsigmoid + ReLU，仍执行 single 和 Agent 两种模式：
 
     # 按配置中的 GPU、采样和预算运行指定题目；目录必须是新目录。
@@ -160,5 +160,23 @@ p1.run 支持 --task-id，从公共 pilot 题单中精确选取一道题，在�
     # 只读预览，确认 task_count 为 1；不加载模型、不启动 GPU。
     bash scripts/p1-run.sh --run runs/p1/run-pilot-1-v7 --task-id ops6k-9fbe88dcf4053fa4 --dry-run
 
-续跑单题目录可直接使用原 --run 加 --resume；显式传 --task-id 时必须与原单题题单一致。
+续跑单题目录可直接使用原 --run 加 --resume；显式传 --task-id 时必须与原冻结题单完全一致。
 不能用该参数缩减已有多题运行。仅改变目录名中的数字不会改变实际题目数量。
+
+## 手动配置每卡并发
+
+在 `configs/p1-pilot.json` 设置 `generation_concurrency` 和 `evaluation_concurrency`。
+两者都接受统一正整数，例如 3；也接受按卡号指定的字典，例如 `{"0":2,"2":3}`。
+字典的卡号应与对应 GPU 列表一致，不限制最多两题。生成同卡共享一个模型，正确性检查同卡共享槽位；正式性能测时始终独占一张卡。`compile_workers` 控制全项目 CPU 编译槽数。
+
+```bash
+# 先预览四题及逐卡并发，不启动 GPU；目录名里的 2 不决定实际题数。
+bash scripts/p1-run.sh --run runs/p1/run-pilot-2-v9 --task-id ops6k-9fbe88dcf4053fa4 ops6k-f3750b017c78d8f0 ops6k-030adfe946c4729a ops6k-9c9053934a250410 --dry-run
+# 实际运行同一四题，按配置两张生成卡各同时推进两题。
+bash scripts/p1-run.sh --run runs/p1/run-pilot-2-v9 --task-id ops6k-9fbe88dcf4053fa4 ops6k-f3750b017c78d8f0 ops6k-030adfe946c4729a ops6k-9c9053934a250410
+```
+
+公共配置仍只一份 worker-config.json。构建缓存保存在 `.runtime/cache/p1-builds/`，参数快照及参考 compile-cache 仍在每题完成后按原规则清理。
+`scheduler/` 中记录任务、生成请求和评测租约，用于查证并发；完整实现及 V7 失败原因见报告第 19、20 节。
+
+实际双卡四题并发、编译缓存、34 次隐藏验收及纯 CPU 构建边界的验证记录见报告第 21 节。V9 完整成绩请以该 run 的 manifest/summary 为准，不能把首轮中止记录当成完整结果。

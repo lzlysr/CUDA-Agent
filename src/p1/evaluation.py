@@ -23,10 +23,13 @@ import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import torch
 from .data import ROOT, sha
 from .helper.baseline_state import atomic_json as dump
 from .helper.workspace import workspace_path
+from .helper.build_cache import build_identity, cache_lock, compilation_slot
+from .helper.stream_transport import stream_directories
 
 # 限制宿主 PyTorch 的 CPU 算子线程数，避免外部比较器占用过多 CPU。
 torch.set_num_threads(4)
@@ -37,6 +40,10 @@ torch.set_num_threads(4)
 class InfrastructureError(RuntimeError):
     # 只定义异常类型，不额外改写 RuntimeError 的默认行为。
     pass
+
+
+class _ReferenceStreamFailure(InfrastructureError):
+    """参考流失败的内部标记；外层释放共享租约后按原协议完整重试一次。"""
 
 
 # audit_contract 返回阻断项和复核提示；contract 保留为既有兼容导出。
@@ -78,26 +85,30 @@ def compare(actual, expected, atol=0.01, rtol=0.01):
                     f"got {tuple(a.shape)} {a.dtype}"
                 )
                 return
-            # 仅浮点/复数张量统计连续数值误差；整数等类型仍会经过下方 assert_close。
-            if a.is_floating_point() or a.is_complex():
-                # 候选和参考两边都必须有限；&= 让之前发现的非有限值不会被后续正常节点覆盖。
-                finite &= bool(torch.isfinite(a).all() and torch.isfinite(b).all())
-                # 逐元素取候选减参考的绝对值；对于复数，这里得到差值的模。
-                delta = (a - b).abs()
-                # 空张量没有最大元素，按 0 处理，避免对空张量调用 max 报错。
-                max_abs = max(max_abs, float(delta.max()) if delta.numel() else 0.0)
-                # 相对误差以参考值绝对值为分母；加 1e-8 避免参考值为零时直接除零。
-                max_rel = max(
-                    max_rel, float((delta / (b.abs() + 1e-8)).max()) if delta.numel() else 0.0
-                )
-            # 使用 PyTorch 的正式数值断言决定是否通过；上面的 max_abs/max_rel 主要用于诊断。
-            try:
-                # 容差判定使用 atol/rtol；equal_nan=False 明确禁止两边同为 NaN 时算通过。
-                torch.testing.assert_close(a, b, atol=atol, rtol=rtol, equal_nan=False)
-            # 数值断言失败只转成当前节点的错误记录，让其他输出节点仍可继续检查。
-            except AssertionError as error:
-                # 保留实际不匹配比例、最大误差位置，供 Agent 定位归约/索引/精度错误。
-                errors.append(key + ": numerical mismatch\n" + str(error)[:1500])
+            # 每块最多 8M 元素；只改变外部比较的内存使用，不减少比较元素。
+            flat_a, flat_b = a.reshape(-1), b.reshape(-1)
+            chunk = 8 * 1024 * 1024
+            for begin in range(0, max(1, a.numel()), chunk):
+                aa = flat_a[begin:begin + chunk]
+                bb = flat_b[begin:begin + chunk]
+                if a.is_floating_point() or a.is_complex():
+                    finite &= bool(torch.isfinite(aa).all() and torch.isfinite(bb).all())
+                    delta = (aa - bb).abs()
+                    max_abs = max(max_abs, float(delta.max()) if delta.numel() else 0.0)
+                    max_rel = max(
+                        max_rel,
+                        float((delta / (bb.abs() + 1e-8)).max()) if delta.numel() else 0.0,
+                    )
+                try:
+                    torch.testing.assert_close(
+                        aa, bb, atol=atol, rtol=rtol, equal_nan=False
+                    )
+                except AssertionError as error:
+                    # 错误位置附带原张量的扁平偏移；仍遍历剩余全部元素并统计最大误差。
+                    if len(errors) < 10:
+                        errors.append(
+                            f"{key}: numerical mismatch at flat offset {begin}\n{str(error)[:1500]}"
+                        )
         # 列表和元组分支：先检查长度，然后按位置逐项递归。
         elif isinstance(a, (list, tuple)):
             # 长度不同意味着输出结构不完整或多出内容，无需继续 zip 截断比较。
@@ -171,8 +182,8 @@ class Evaluator:
         self.seconds = 0.0  
         # 该计数器记录本 Evaluator 实例发起的候选编译尝试，不代表编译成功数。
         self.compiles = 0
-        # 仅供不计分的调参脚本复用本控制器构建的扩展；正式验收仍独立重编译。
-        self._compiled_builds = {}
+        self.cache_hits = 0
+        self.stop_event = None
         # 读取已有评测目录的最大编号，默认 0。 为每次候选快照分配新的编号，避免覆盖已有记录
         self.counter = max(
             (
@@ -214,6 +225,7 @@ class Evaluator:
         experiment=None,
         script=None,
         script_args=None,
+        stream=None,
     ):
         """输入模式、输出目录、只读挂载和超时；在指定编号 GPU 隔离执行，返回状态/日志/耗时。"""
         # 统一输出路径类型，并建立可写的宿主结果目录。
@@ -254,9 +266,12 @@ class Evaluator:
             "/tmp:rw,nosuid,size=8g",
             # 将容器共享内存 /dev/shm 的大小设为 1 GiB。
             "--shm-size=1g",
-            "--gpus",
-            "device=" + str(self.gpu),
         ]
+        if mode == "compile":
+            # NVCC 仅使用 CPU；明确隐藏设备，编译期间不占用 GPU 租约。
+            c += ["-e", "CUDA_VISIBLE_DEVICES=", "-e", "NVIDIA_VISIBLE_DEVICES=none"]
+        else:
+            c += ["--gpus", "device=" + str(self.gpu)]
         # 挂载表每项为（宿主路径，容器路径，ro/rw）；只开放此模式需要的文件。
         mounts = [
             # 把 kernel 环境只读挂到相同绝对路径，保留 Python/入口脚本所需的安装前缀。
@@ -286,11 +301,14 @@ class Evaluator:
             (build, "/build"),
             # 自定义开发脚本另行冻结，不挂载参考模型、隐藏输入或原始可写工作区。
             (experiment, "/experiment"),
+            # 每个容器只得到自己的临时输出通道，不暴露另一端或整个 /dev/shm。
+            (stream, "/stream"),
         ]:
             # None 表示本次模式不需要该目录，因此完全不挂载。
             if p is not None:
                 # 只有 /build 可写，参考源码、候选源码与输入定义都按只读挂载。
-                mounts.append((Path(p), d, "rw" if d == "/build" and mode != "script" else "ro"))
+                writable = (d == "/build" and mode == "compile") or d == "/stream"
+                mounts.append((Path(p), d, "rw" if writable else "ro"))
         # 把挂载表逐项转换成 Docker --mount 参数。
         for p, d, perm in mounts:
             c += [
@@ -413,7 +431,8 @@ class Evaluator:
         # 把本次控制器耗时附到结构化结果；kernel 加速比应使用 cuda_ms。
         result["controller_seconds"] = elapsed
         # 持久保存实际使用的物理编号；多卡恢复不依赖可能损坏的根摘要推断来源。
-        result["evaluation_gpu"] = self.gpu
+        # 编译只用 CPU；其余容器记录实际租用的评测卡。
+        result["evaluation_gpu"] = None if mode == "compile" else self.gpu
         # 补齐控制器耗时后覆盖同一份阶段结果；超时/缺少 worker 输出也保留此记录。
         dump(result_path, result)
         return result
@@ -570,6 +589,49 @@ class Evaluator:
         # 把静态阻断项单独返回给调用者，决定是否继续启动编译容器。
         return ev, snap, result, audit["issues"]
 
+    @contextmanager
+    def gpu_operation(self, exclusive=True):
+        """输入是否计时；单卡基础实现直接使用指定卡，多卡子类负责读写租约。"""
+        yield
+
+    def compile_snapshot(self, snap, ev, result):
+        """输入可信快照/评测目录/摘要；返回已校验编译结果及只读构建目录。"""
+        key, identity = build_identity(ROOT, self.cfg, result["candidate_hash"])
+        cache = ROOT / ".runtime/cache/p1-builds" / key
+        metadata = cache / "cache.json"
+        build = cache / "build"
+        binary = build / "cuda_extension.so"
+        with cache_lock(cache / "cache.lock"):
+            if metadata.is_file() and binary.is_file():
+                saved = json.loads(metadata.read_text())
+                if saved.get("binary_sha256") == sha(binary.read_bytes()):
+                    self.cache_hits += 1
+                    compiled = dict(saved["compilation"])
+                    compiled.update(cache_hit=True, cache_key=key,
+                                    elapsed_seconds=0.0, controller_seconds=0.0)
+                    dump(ev / "compilation/result.json", compiled)
+                    return compiled, build
+            # 损坏/未完成缓存只能在自己的内容寻址目录下重建。
+            if build.exists():
+                if not build.resolve().is_relative_to(cache.resolve()):
+                    raise ValueError("编译缓存路径越界")
+                shutil.rmtree(build)
+            build.mkdir(parents=True)
+            with compilation_slot(ROOT, self.cfg.get("compile_workers", 2), self.stop_event):
+                compiled = self.container(
+                    "compile", ev / "compilation", candidate=snap, build=build,
+                    timeout=self.cfg["compile_seconds"],
+                )
+            self.compiles += 1
+            compiled.update(cache_hit=False, cache_key=key)
+            dump(ev / "compilation/result.json", compiled)
+            if compiled["status"] == "ok" and binary.is_file():
+                dump(metadata, {
+                    "identity": identity, "compilation": compiled,
+                    "binary_sha256": sha(binary.read_bytes()),
+                })
+            return compiled, build
+
     # 八、仅编译工具：workspace 是开发目录；task 保留为统一调用接口参数。
     # 输出编译日志、编译状态和可选扩展路径，不得把编译成功理解为数值正确或更快。
     def compile_only(self, task, workspace):
@@ -583,19 +645,7 @@ class Evaluator:
             # 把违规列表放进结果，供 Agent 定位需要修改的源码。
             result.update(status="contract_violation", issues=issues)
         else:
-            # 本次编译使用评测目录下全新的 build，不复用工作区已有二进制。
-            build = ev / "build"
-            build.mkdir()
-            # 在隔离容器中编译冻结源码，编译上限使用单独的 compile_seconds。
-            compiled = self.container(
-                "compile",
-                ev / "compilation",
-                candidate=snap,
-                build=build,
-                timeout=self.cfg["compile_seconds"],
-            )
-            # 只要实际发起容器编译就记一次尝试，不论最终成功还是失败。
-            self.compiles += 1
+            compiled, build = self.compile_snapshot(snap, ev, result)
             # 保留 worker 编译细节，同时转换成仅编译工具对外的状态名称。
             result.update(
                 compilation=compiled,
@@ -603,7 +653,7 @@ class Evaluator:
             )
             # 编译成功才尝试把扩展发布回工作区，让 Agent 继续调试调用。
             if compiled["status"] == "ok":
-                # 与原 compile.sh 一样提供工作区扩展；正式验收仍从源码独立重编译，
+                # 与原 compile.sh 一样提供工作区扩展；正式验收仅复用控制器按冻结源码构建且哈希一致的缓存，
                 # 不信任 Agent 工作区已有的 .so，也不暴露参考结果。
                 # 隔离 build 内本次实际产出的扩展文件。
                 binary = build / "cuda_extension.so"
@@ -614,9 +664,8 @@ class Evaluator:
                     raise ValueError("extension output must not be a symlink")
                 # 确认编译确实生成目标文件，才执行复制。
                 if binary.is_file():
-                    # copy2 复制扩展并尽量保留元数据；正式验收仍会从源码重新编译。
+                    # copy2 复制扩展并尽量保留元数据；正式验收不会采用工作区中可被模型改动的二进制。
                     shutil.copy2(binary, destination)
-                    self._compiled_builds[result["candidate_hash"]] = build
                     # 只返回工作区相对文件名，不把参考输出或参考状态路径暴露给工具。
                     result["artifact"] = "cuda_extension.so"
         # 无论静态阻断还是编译结果，都为本次提交保存 result.json。
@@ -659,27 +708,17 @@ class Evaluator:
                     destination = experiment / rel
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(checked.read_bytes())
-            # 源码未变时复用之前由本控制器生成的 build，不信任工作区自带的 .so。
-            build = self._compiled_builds.get(result["candidate_hash"])
-            if build is None or not (build / "cuda_extension.so").is_file():
-                build = ev / "build"
-                build.mkdir()
-                compiled = self.container(
-                    "compile", ev / "compilation", candidate=snap, build=build,
-                    timeout=self.cfg["compile_seconds"],
-                )
-                self.compiles += 1
-                result["compilation"] = compiled
-                if compiled["status"] == "ok":
-                    self._compiled_builds[result["candidate_hash"]] = build
-                else:
-                    result["status"] = "compilation_failed"
-            if "status" not in result:
-                execution = self.container(
-                    "script", ev / "script", candidate=snap, build=build,
-                    experiment=experiment, script=relative.as_posix(), script_args=args,
-                    timeout=self.cfg.get("shell_seconds", 600),
-                )
+            compiled, build = self.compile_snapshot(snap, ev, result)
+            result["compilation"] = compiled
+            if compiled["status"] != "ok":
+                result["status"] = "compilation_failed"
+            else:
+                with self.gpu_operation(exclusive=True):
+                    execution = self.container(
+                        "script", ev / "script", candidate=snap, build=build,
+                        experiment=experiment, script=relative.as_posix(), script_args=args,
+                        timeout=self.cfg.get("shell_seconds", 600),
+                    )
                 log = ev / "script/worker.log"
                 result.update(status=execution["status"], execution=execution,
                               output=log.read_text()[-20000:] if log.exists() else "")
@@ -692,7 +731,16 @@ class Evaluator:
     # worker 每次原子发布 item.pt 后等待控制器删除文件，删除即确认，随后才输出下一例。
     # 因此两边无需把所有大张量同时堆在宿主内存里，也不能直接读取对方的输出文件。
     def streamed_checks(self, task, snap, build, ev, phase):
-        """输入题目、快照、构建与阶段；外部逐例比较，返回 checks、参考状态、候选状态。"""
+        """输入固定候选和阶段；独立通道传输输出，返回原协议的逐例验算结果。"""
+        with stream_directories(self.cfg, ev) as (expected, actual, transport):
+            checks, reference, candidate = self._streamed_checks(
+                task, snap, build, ev, phase, expected, actual
+            )
+            candidate["stream_transport"] = transport
+            return checks, reference, candidate
+
+    def _streamed_checks(self, task, snap, build, ev, phase, expected_channel, actual_channel):
+        """输入两个仅对各自容器可见的通道；按原顺序比较每一例，不抽样、不降精度。"""
         # 定位已准备好的可信参考及固定参数。
         ref = self.run / "references" / task["task_id"]
         # 参考容器只把结果写入 reference-stream。
@@ -720,6 +768,7 @@ class Evaluator:
                 self.container,
                 "reference_stream",
                 expected,
+                stream=expected_channel,
                 reference=ref,
                 # 双方读同一套固定参数/输入定义，从种子生成相同测试输入。
                 inputs=ref / "cases/input-spec",
@@ -731,6 +780,7 @@ class Evaluator:
                 self.container,
                 "candidate_stream",
                 actual,
+                stream=actual_channel,
                 candidate=snap,
                 inputs=ref / "cases/input-spec",
                 build=build,
@@ -741,14 +791,14 @@ class Evaluator:
             # 若只延长容器预算而不改此循环，控制器仍会提前停止消费输出。
             while time.monotonic() - started < stream_seconds + 5:
                 # 每端只有一个待确认的 item.pt 槽位，worker 在该文件被删除前不会发布下一例。
-                a, b = expected / "item.pt", actual / "item.pt"
+                a, b = expected_channel / "item.pt", actual_channel / "item.pt"
                 # 只有参考和候选都发布当前结果，才进行配对比较。
                 if a.exists() and b.exists():
                     try:
                         # weights_only=True 限制反序列化可接受的对象，不使用允许任意对象的普通 pickle 加载。
-                        r = torch.load(a, weights_only=True)
+                        r = torch.load(a, weights_only=True, mmap=True)
                         # 读取候选的输出树；worker 发布前已把张量转到 CPU。
-                        c = torch.load(b, weights_only=True)
+                        c = torch.load(b, weights_only=True, mmap=True)
                         # 案例标签必须相同；顺序错乱属于评测协议错误，不能比较两份不同输入的输出。
                         if r["id"] != c["id"]:
                             raise InfrastructureError("stream case order differs")
@@ -851,28 +901,29 @@ class Evaluator:
             result.update(status="contract_violation", issues=issues)
             dump(ev / "result.json", result)
             return result
-        # 第二道关：建立独立 build，从冻结源码重新编译候选扩展。
-        build = ev / "build"
-        build.mkdir()
-        # 正式评测不加载 Agent 工作区现成 .so，以免混入与快照不一致的二进制。
-        compiled = self.container(
-            "compile",
-            ev / "compilation",
-            candidate=snap,
-            build=build,
-            timeout=self.cfg["compile_seconds"],
-        )
-        # 累计本次实际候选编译尝试。
-        self.compiles += 1
-        # 把完整编译结果收入本次评测，保留错误原因和控制器耗时。
+        compiled, build = self.compile_snapshot(snap, ev, result)
         result["compilation"] = compiled
-        # 候选编译失败是候选结果，保留默认的 correct=False、reward=-1 并提前返回。
         if compiled["status"] != "ok":
             result.update(status="compilation_failed")
             dump(ev / "result.json", result)
             return result
-        self._compiled_builds[result["candidate_hash"]] = build
-        # 第三道关：反馈与隐藏使用不同案例协议，隐藏还会检查重复调用和输入/权重变化。
+        # 正确性验算可并发；完成后释放卡，再申请独占性能测量。
+        try:
+            with self.gpu_operation(exclusive=False):
+                checked = self._check_candidate(task, snap, build, ev, result, final, attempt)
+        except _ReferenceStreamFailure:
+            if attempt == 0:
+                return self.evaluate(task, snap, final, attempt=1, measure=measure)
+            raise InfrastructureError("reference stream failed twice; do not assign model reward")
+        if not checked["correct"] or final or not measure:
+            checked["reward"] = 1 if checked["correct"] else -1
+            dump(ev / "result.json", checked)
+            return checked
+        with self.gpu_operation(exclusive=True):
+            return self._measure_candidate(task, snap, build, ev, checked, final, attempt)
+
+    def _check_candidate(self, task, snap, build, ev, result, final, attempt):
+        """输入已编译候选；仅执行原有反馈/隐藏验算，返回数值与状态结论。"""
         phase = "hidden" if final else "feedback"
         # 两端分别执行，宿主逐例核对输出；ran 是候选 worker 最终返回的状态。
         checks, reference, ran = self.streamed_checks(task, snap, build, ev, phase)
@@ -894,12 +945,8 @@ class Evaluator:
                 "reference": reference, "candidate": ran, "checks": checks,
                 "reference_health": result.get("stream_failure", {}).get("reference_health"),
             })
-            # 首次参考故障允许对同一份快照完整重试一次；新调用会生成新的评测目录。
-            if attempt == 0:
-                # 重试保留 final 和 measure，不能把隐藏验收或仅正确性检查意外变成其他模式。
-                return self.evaluate(task, snap, final, attempt=1, measure=measure)
-            # 第二次参考仍失败就抛基础设施异常，由上层决定如何处理，不输出模型失败奖励。
-            raise InfrastructureError("reference stream failed twice; do not assign model reward")
+            # 由 evaluate 在释放当前租约后完整重试，保持原来的测时/隐藏标记。
+            raise _ReferenceStreamFailure("reference stream failed")
         # 精确核对预期比较次数，防止少执行案例或提前退出却因已通过的少量样例而获通过。
         expected_n = (
             # 反馈阶段每个案例只发布一次普通输出。
@@ -929,13 +976,11 @@ class Evaluator:
                 and not ran.get("state_mutations")
             ),
         )
-        # 错误候选、最终隐藏验收、或显式禁用测时，均在正确性阶段结束。
-        if not result["correct"] or final or not measure:
-            # 这三类路径只给正确性基础奖励：正确为 1，错误为 -1，不生成速度奖励。
-            result["reward"] = 1 if result["correct"] else -1
-            # 保存此阶段结论，使没有性能结果的评测仍有完整记录。
-            dump(ev / "result.json", result)
-            return result
+        return result
+
+    def _measure_candidate(self, task, snap, build, ev, result, final, attempt):
+        """输入数值正确候选；独占一张卡完成参考前测、候选、参考后测及漂移检查。"""
+        ref = self.run / "references" / task["task_id"]
         # 候选独占测时前后都重测参考基线，以检测资源干扰和计时漂移。
         # 第四道关先测参考，再测候选，最后再测参考；三个调用依次执行而非同时测时。
         before = self.container(

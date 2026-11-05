@@ -301,8 +301,9 @@ def prepare(cfg):
 # 编译入口无显式参数，使用约定挂载路径和构建目录，成功返回 compiled=True。
 def compile_candidate():
     """无参数；使用固定源文件/编译参数生成扩展，返回 compiled=True，失败抛错。"""
-    # PyTorch 扩展加载器负责调用编译工具，生成并加载 Python 可导入的原生扩展。
-    from torch.utils.cpp_extension import load as extload
+    # 与原 load 使用同一 Ninja 构建器，但不导入 .so，也不运行候选静态初始化。
+    # 当前固定 torch 版本已核对该接口；升级 torch 时须一并核对构建器签名。
+    from torch.utils.cpp_extension import _write_ninja_file_and_build_library
 
     # 收集固定绑定源文件和候选 kernels 下的 CUDA/C++ 源码。
     sources = (
@@ -344,8 +345,9 @@ def compile_candidate():
     ]
     # 指定 cuDNN/cuBLAS 动态库的实际文件路径，供链接阶段使用。
     libs = [site / "nvidia/cudnn/lib/libcudnn.so.9", site / "nvidia/cublas/lib/libcublas.so.12"]
-    # 开始构建并加载扩展；发生编译、链接或加载错误时异常由 main 收集。
-    extload(
+    # 只做 CPU 编译/链接。扩展的加载及 CUDA 初始化在 GPU 验算容器中检查，
+    # 避免纯 CPU 编译因合法的 CUDA 静态初始化而失败，也避免编译抢占测时 GPU。
+    _write_ninja_file_and_build_library(
         # 固定扩展名，候选 Python 可通过 import cuda_extension 使用。
         name="cuda_extension",
         # 把 Path 列表转换为构建工具接受的路径字符串列表。
@@ -354,6 +356,9 @@ def compile_candidate():
         build_directory="/build",
         # 明确启用 CUDA 扩展构建。
         with_cuda=True,
+        # 本项目只构建 CUDA，不启用 SYCL；保留当前构建器要求的显式参数。
+        with_sycl=False,
+        extra_sycl_cflags=[],
         # 关闭构建过程的详细命令打印，错误仍会通过异常反馈。
         verbose=False,
         # 向编译器添加上方 NVIDIA 库的头文件搜索路径。
@@ -365,7 +370,7 @@ def compile_candidate():
         # CUDA 编译采用 O3 与 fast-math，结果正确性仍需后续数值检查确认。
         extra_cuda_cflags=["-O3", "--use_fast_math"],
     )
-    # 这里只表示扩展编译/加载成功，不表示数值正确或性能达标。
+    # 这里只表示编译/链接成功；加载、数值正确性和性能分别在后续 GPU 阶段检查。
     return {"compiled": True}
 
 
@@ -628,9 +633,10 @@ def stream(cfg, phase, candidate):
         # 嵌套函数需要修改 stream 外层的输出计数器。
         nonlocal count
         # 宿主比较器轮询读取的固定文件名。
-        target = Path("/outputs/item.pt")
+        channel = Path("/stream") if Path("/stream").is_dir() else Path("/outputs")
+        target = channel / "item.pt"
         # 先写临时文件，避免宿主读到尚未写完的序列化内容。
-        tmp = Path("/outputs/item.tmp")
+        tmp = channel / "item.tmp"
         # 输出先转 CPU，再与案例 ID 一起序列化；参考和候选各有独立的输出挂载目录。
         progress("serialize_output", label)
         SAVE({"id": label, "output": cpu(value)}, tmp)
@@ -784,7 +790,7 @@ def main():
         result.update(
             status="ok",
             elapsed_seconds=CLOCK() - started,
-            gpu_uuid=str(torch.cuda.get_device_properties(0).uuid),
+            gpu_uuid=(None if a.mode == "compile" else str(torch.cuda.get_device_properties(0).uuid)),
         )
     except Exception as e:
         result = {

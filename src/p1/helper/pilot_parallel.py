@@ -24,6 +24,7 @@ from .baseline_state import (
     archive_incomplete, atomic_json, beijing_now, cleanup_reference_artifacts,
 )
 from ..evaluation import Evaluator
+from .inference import InferenceService, concurrency
 
 LOCK_ROOT = Path(__file__).resolve().parents[3] / ".runtime/locks"
 MODES = ("single", "agent")
@@ -45,6 +46,10 @@ def gpu_roles(cfg):
     evaluation = gpu_numbers(cfg.get("evaluation_gpu", 3), "evaluation_gpu")
     if set(generation) & set(evaluation):
         raise ValueError("generation_gpu 与 evaluation_gpu 不能包含相同 GPU")
+    for gpu in generation:
+        concurrency(cfg, "generation_concurrency", gpu)
+    for gpu in evaluation:
+        concurrency(cfg, "evaluation_concurrency", gpu)
     return generation, evaluation
 
 
@@ -68,36 +73,95 @@ def blocking_lock(path):
 
 
 class EvaluationPool:
-    """用文件锁租用整张评测卡；不存放令牌，进程崩溃不会永久丢失 GPU 配额。"""
+    """每卡提供可配置验算槽位；性能测量使用写锁，等待同卡全部读作业结束。"""
 
-    def __init__(self, devices, directory, stop=None):
-        """输入编号列表、锁目录和可选停止事件；初始化轮询起点，不启动 GPU。"""
+    def __init__(self, devices, directory, stop=None, cfg=None, log=None):
+        """输入卡号、锁目录、停止事件和配置；初始化读写锁及逐卡并发上限。"""
         self.devices = gpu_numbers(devices, "evaluation_gpu")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.stop = stop
+        self.cfg = cfg or {}
+        self.log = Path(log) if log is not None else self.directory / "evaluation-events.jsonl"
+        self.log.parent.mkdir(parents=True, exist_ok=True)
         self.offset = 0
 
+    def record(self, event, gpu, exclusive, slot=None):
+        """输入租约状态；追加北京时间日志，用于核对实际并发和独占测时。"""
+        with self.log.open("a", encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            stream.write(json.dumps({
+                "at": beijing_now().isoformat(timespec="milliseconds"),
+                "event": event, "evaluation_gpu": gpu,
+                "exclusive": exclusive, "slot": slot, "pid": os.getpid(),
+                "thread": threading.current_thread().name,
+            }) + "\n")
+            stream.flush()
+
     @contextmanager
-    def lease(self):
-        """无输入；等待空闲卡并返回物理编号，退出时释放；停止时不再启动新作业。"""
+    def lease(self, exclusive=True):
+        """输入是否正式计时；返回物理卡号，验算读锁可并发、计时写锁完全独占。"""
         while True:
             if self.stop is not None and self.stop.is_set():
                 raise InterruptedError("P1 已请求停止，取消等待评测卡")
             order = self.devices[self.offset:] + self.devices[:self.offset]
             for gpu in order:
-                stream = (self.directory / f"evaluation-gpu-{gpu}.lock").open("a+")
+                gate = (self.directory / f"evaluation-gpu-{gpu}.gate").open("a+")
+                main = (self.directory / f"evaluation-gpu-{gpu}.lock").open("a+")
+                slot = None
+                slot_index = None
+                acquired = False
                 try:
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # 写者先占门闩，阻止新验算继续进入，避免测速长期饥饿。
+                    fcntl.flock(
+                        gate, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                        | fcntl.LOCK_NB,
+                    )
+                    if exclusive:
+                        while True:
+                            try:
+                                fcntl.flock(main, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except BlockingIOError:
+                                if self.stop is not None and self.stop.is_set():
+                                    raise InterruptedError("停止等待独占测时")
+                                time.sleep(0.05)
+                    else:
+                        fcntl.flock(main, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        for index in range(concurrency(self.cfg, "evaluation_concurrency", gpu)):
+                            candidate = (self.directory / f"evaluation-gpu-{gpu}-slot-{index}.lock").open("a+")
+                            try:
+                                fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                candidate.close()
+                                continue
+                            slot, slot_index = candidate, index
+                            break
+                        if slot is None:
+                            continue
+                        # 验算只短暂经过门闩；写者可以占门闩等待已有读者自然退出。
+                        fcntl.flock(gate, fcntl.LOCK_UN)
+                    acquired = True
                 except BlockingIOError:
-                    stream.close()
+                    pass
+                finally:
+                    if not acquired:
+                        if slot is not None:
+                            slot.close()
+                        main.close()
+                        gate.close()
+                if not acquired:
                     continue
                 self.offset = (self.devices.index(gpu) + 1) % len(self.devices)
+                self.record("lease_started", gpu, exclusive, slot_index)
                 try:
                     yield gpu
                 finally:
-                    fcntl.flock(stream, fcntl.LOCK_UN)
-                    stream.close()
+                    self.record("lease_finished", gpu, exclusive, slot_index)
+                    if slot is not None:
+                        slot.close()
+                    main.close()
+                    gate.close()
                 return
             time.sleep(0.05)
 
@@ -113,13 +177,13 @@ class ParallelEvaluator(Evaluator):
         self._leased = False
 
     @contextmanager
-    def operation(self):
+    def operation(self, exclusive=True):
         """无输入；完整作业持有同一张卡，嵌套 prepare/重试复用已有租约。"""
         with self._operation_lock:
             if self._leased:
                 yield
                 return
-            with self.pool.lease() as gpu:
+            with self.pool.lease(exclusive=exclusive) as gpu:
                 self.gpu = gpu
                 self._leased = True
                 try:
@@ -137,20 +201,9 @@ class ParallelEvaluator(Evaluator):
         with self.operation():
             return super().profile_reference(task)
 
-    def compile_only(self, task, workspace):
-        """输入任务/工作区；隔离编译期间持卡，返回原编译反馈。"""
-        with self.operation():
-            return super().compile_only(task, workspace)
-
-    def evaluate(self, task, workspace, *args, **kwargs):
-        """输入任务、候选和原评测选项；整组编译/检查/前后测时固定使用一张卡。"""
-        with self.operation():
-            return super().evaluate(task, workspace, *args, **kwargs)
-
-    def run_script(self, task, workspace, script, args=None):
-        """输入辅助脚本；编译复用和 GPU 运行期间持有同一份评测卡租约。"""
-        with self.operation():
-            return super().run_script(task, workspace, script, args)
+    def gpu_operation(self, exclusive=True):
+        """输入阶段类型；编译不取卡，验算共享槽位，正式计时独占。"""
+        return self.operation(exclusive=exclusive)
 
     def snapshot(self, workspace):
         """输入工作区；跨进程串行分配 evaluations 编号，返回原快照与审查结果。"""
@@ -194,65 +247,105 @@ def archive_partial_trajectory(run, task_id, mode):
 
 
 def generation_worker(cfg, run, gpu, directory, jobs, events, stop, pilot_factory=None):
-    """子进程入口：输入公共配置、卡号和队列；常驻一个模型副本，输出逐轨迹事件及成本。
-
-    整题派发保证同题 single/agent 不并发；种子使用父进程给出的固定题目 index。
-    该进程不写根汇总或清理参考参数，父进程收到完成事件并保存后负责清理。
-    pilot_factory 仅供 CPU 测试替换真实模型，不改变生产调用方式。
-    """
-    # 独立会话避免终端 Ctrl+C 直接打断 vLLM；停止请求由父进程事件传递。
-    if pilot_factory is None:
+    """输入卡号和任务队列；一份模型服务多个独立题目，逐题回传两种模式结果。"""
+    real_model = pilot_factory is None
+    if real_model:
         os.setsid()
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    os.environ["VLLM_NO_USAGE_STATS"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
-    if pilot_factory is None:
+    if real_model:
         from ..run import Pilot
+        from ..data import ROOT
         pilot_factory = Pilot
-    pilot = None
+    service = None
+    pilots = []
     finished = 0
-    try:
-        pool = EvaluationPool(gpu_roles(cfg)[1], directory, stop)
+    state_lock = threading.Lock()
+    started = time.monotonic()
+
+    def consume():
+        """每个控制线程有自己的 Pilot/评测器；只共享模型服务和跨进程资源锁。"""
+        nonlocal finished
+        pool = EvaluationPool(
+            gpu_roles(cfg)[1], directory, stop, cfg,
+            log=Path(run) / "scheduler/evaluation.jsonl",
+        )
         evaluator = ParallelEvaluator(cfg, run, pool)
+        evaluator.stop_event = stop
         pilot = pilot_factory(cfg, Path(run), generation_gpu=gpu, evaluator=evaluator)
         pilot.stop_event = stop
-        while not stop.is_set():
-            job = jobs.get()
-            if job is None:
-                break
-            index, task = job
-            for mode in MODES:
-                if stop.is_set():
-                    raise InterruptedError("P1 已请求停止")
-                row = saved_trajectory(run, task["task_id"], mode)
-                if row is None:
-                    archive_partial_trajectory(run, task["task_id"], mode)
-                    pilot.model()
-                    row = compact_result(pilot.trajectory(task, mode, index))
-                events.put(("result", row))
-            finished += 1
-            events.put(("task_complete", task["task_id"]))
-    except InterruptedError:
-        stop.set()
+        if service is not None:
+            pilot.inference = service
+            pilot.tokenizer = service.tokenizer
+            pilot.model_started = service.started
+        with state_lock:
+            pilots.append(pilot)
+        try:
+            while not stop.is_set():
+                job = jobs.get()
+                if job is None:
+                    break
+                index, task = job
+                events.put(("task_started", {
+                    "task_id": task["task_id"], "generation_gpu": gpu,
+                    "thread": threading.current_thread().name,
+                    "at": beijing_now().isoformat(timespec="milliseconds"),
+                }))
+                for mode in MODES:
+                    if stop.is_set():
+                        raise InterruptedError("P1 已请求停止")
+                    row = saved_trajectory(run, task["task_id"], mode)
+                    if row is None:
+                        archive_partial_trajectory(run, task["task_id"], mode)
+                        pilot.model()
+                        row = compact_result(pilot.trajectory(task, mode, index))
+                    events.put(("result", row))
+                with state_lock:
+                    finished += 1
+                events.put(("task_complete", task["task_id"]))
+        finally:
+            pilot.close_model()
+
+    try:
+        if real_model:
+            service = InferenceService(cfg, ROOT, gpu, run, stop)
+        count = concurrency(cfg, "generation_concurrency", gpu)
+        with ThreadPoolExecutor(max_workers=count, thread_name_prefix=f"trajectory-gpu-{gpu}") as pool:
+            futures = [pool.submit(consume) for _ in range(count)]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except InterruptedError:
+                    stop.set()
+                except BaseException:
+                    stop.set()
+                    events.put(("error", {"generation_gpu": gpu, "traceback": traceback.format_exc()}))
     except BaseException:
         stop.set()
         events.put(("error", {"generation_gpu": gpu, "traceback": traceback.format_exc()}))
     finally:
-        reserved = (time.monotonic() - pilot.model_started
-                    if pilot is not None and hasattr(pilot, "model_started") else 0)
-        # 先释放模型引擎，再报告退出；释放失败也必须让父进程获知。
-        if pilot is not None:
+        if service is not None:
             try:
-                pilot.close_model()
+                service.close()
             except BaseException:
                 stop.set()
                 events.put(("error", {"generation_gpu": gpu, "traceback": traceback.format_exc()}))
         events.put(("worker_done", {
             "generation_gpu": gpu, "tasks_completed": finished,
-            "generation_gpu_reserved_seconds": reserved,
-            "container_seconds": pilot.ev.seconds if pilot is not None else 0,
-            "compiles": pilot.ev.compiles if pilot is not None else 0,
+            "generation_gpu_reserved_seconds": time.monotonic() - started,
+            "container_seconds": sum(p.ev.seconds for p in pilots),
+            "compiles": sum(p.ev.compiles for p in pilots),
+            "compile_cache_hits": sum(getattr(p.ev, "cache_hits", 0) for p in pilots),
+            "max_active_sequences": service.peak_active if service is not None else None,
+            "model_startup_seconds": service.startup_seconds if service is not None else None,
+            "generation_requests": service.requests if service is not None else None,
         }))
 
 
@@ -268,8 +361,9 @@ def run_generation_workers(cfg, run, pending, directory, stop, on_event,
     devices = gpu_roles(cfg)[0][:len(pending)]
     for job in pending:
         jobs.put(job)
-    for _ in devices:
-        jobs.put(None)
+    for gpu in devices:
+        for _ in range(concurrency(cfg, "generation_concurrency", gpu)):
+            jobs.put(None)
     workers = [context.Process(target=worker_target,
                                args=(cfg, str(run), gpu, str(directory), jobs, events, stop),
                                name=f"p1-generation-gpu-{gpu}") for gpu in devices]
@@ -354,7 +448,9 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
     atomic_json(task_file, tasks)
     manifest = pilot.make_manifest(tasks)
     manifest["execution"] = {"generation_gpus": generation, "evaluation_gpus": evaluation,
-                             "generation_strategy": "one_model_replica_per_gpu"}
+                             "generation_strategy": "shared_async_model_per_gpu",
+                             "generation_concurrency": pilot.cfg.get("generation_concurrency", 1),
+                             "evaluation_concurrency": pilot.cfg.get("evaluation_concurrency", 1)}
     atomic_json(pilot.run / "manifest.json", manifest)
     records = {}
     indices = {task["task_id"]: index for index, task in enumerate(tasks)}
@@ -382,7 +478,10 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
         if stop.is_set():
             raise InterruptedError("停止参考预检")
         if not hasattr(local, "evaluator"):
-            pool = EvaluationPool(evaluation, directory, stop)
+            pool = EvaluationPool(
+                evaluation, directory, stop, pilot.cfg,
+                log=pilot.run / "scheduler/evaluation.jsonl",
+            )
             local.evaluator = ParallelEvaluator(pilot.cfg, pilot.run, pool)
             evaluators.append(local.evaluator)
         archive_incomplete(pilot.run, task["task_id"])
@@ -438,10 +537,23 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
 
         def on_event(kind, payload):
             """接收轨迹或整题完成事件；先保存结果，再清理该题参考参数。"""
-            if kind == "result":
+            if kind == "task_started":
+                log = pilot.run / "scheduler/tasks.jsonl"
+                log.parent.mkdir(exist_ok=True)
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"event": kind, **payload}) + "\n")
+                if progress is not None:
+                    progress.write("TASK_START", payload["task_id"], "GPU", payload["generation_gpu"])
+            elif kind == "result":
                 records[(payload["task_id"], payload["mode"])] = payload
                 persist()
             elif kind == "task_complete":
+                log = pilot.run / "scheduler/tasks.jsonl"
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({
+                        "event": "task_finished", "task_id": payload,
+                        "at": beijing_now().isoformat(timespec="milliseconds"),
+                    }) + "\n")
                 if not all((payload, mode) in records for mode in MODES):
                     raise RuntimeError("整题完成事件早于两条轨迹结果")
                 cleanup_reference_artifacts(pilot.run, payload)
@@ -453,6 +565,8 @@ def execute_parallel(pilot, prepare_only=False, stop=None):
                                                  + sum(item["container_seconds"] for item in workers),
             "compiles_this_invocation": sum(item.compiles for item in evaluators)
                                         + sum(item["compiles"] for item in workers),
+            "compile_cache_hits": sum(getattr(item, "cache_hits", 0) for item in evaluators)
+                                  + sum(item.get("compile_cache_hits", 0) for item in workers),
             "generation_gpu_reserved_seconds": sum(item["generation_gpu_reserved_seconds"] for item in workers),
             "generation_workers": workers,
         }

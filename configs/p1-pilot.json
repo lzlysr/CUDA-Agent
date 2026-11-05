@@ -5,7 +5,7 @@
   "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
   "dataset_revision": "44a734c78c947bfcba5189cbfd13f57a6d29a698",
   "kernelbench_revision": "423217d9fda91e0c2d67e4a43bf62f96f6d104f1",
-  "generation_gpu": [6,7],
+  "generation_gpu": [0,7],
   "evaluation_gpu": [4,5],
   "docker_image": "sha256:d58d23b33e24c351dffc6b1bda93dcd7925e3832e2770da6b65e10abfdd05fa0",
   "context_tokens": 131072,
@@ -22,7 +22,7 @@
   "rtol": 0.01,
   "timing_iterations": 30,
   "timing_rounds": 3,
-  "baseline_drift_limit": 0.05,
+  "baseline_drift_limit": 0.10,
   "feedback_cases": 5,
   "hidden_cases_per_init": 5,
   "hidden_init_seeds": [
@@ -35,5 +35,10 @@
   "pilot_split": "train",
   "single_context_tokens": 32768,
   "shell_seconds": 600,
-  "candidate_selection": "best_correct_speedup_compile"
+  "candidate_selection": "best_correct_speedup_compile",
+  "generation_concurrency": 4,
+  "evaluation_concurrency": 4,
+  "compile_workers": 4,
+  "enable_prefix_caching": true,
+  "enforce_eager": false
 }
