@@ -41,14 +41,14 @@ Ctrl+C 或向控制器发 TERM 会停止派新题，等待各卡当前题结束�
 
 ## 运行 Qwen single/agent pilot
 
-当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；当前配置 GPU [0,2] 生成、[3,4] 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，同卡题目共享异步引擎；正确性检查可同卡并发，正式测时独占该卡，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡/长上下文流程已在此前 pilot 执行；当前修复及少量 GPU 验证结果见报告第 14 节。
+当前 `data/processed/pilot.json` 是从 train 按 seed=42 确定性抽取的 12 题。启动脚本会激活 learner；当前配置 GPU [0,7] 生成、[4,5] 评测，均按编号选择。`p1-pilot.json` 的 `generation_gpu`、`evaluation_gpu` 也可分别填编号列表；每张生成卡加载一个完整模型副本，同卡题目共享异步引擎；正确性检查可同卡并发，正式测时独占该卡，两组不能重合。仍共享一份 `worker-config.json`。入口文件、模块与多卡运行说明见报告第 13 节；真实多卡/长上下文流程已在此前 pilot 执行；历史修复见第 14 节；固定生成种子、后测基线、奖励语义和资源边界修复见第 22 节。
 
 ```bash
 cd /home/likun/junjxu/CUDA-Agent
 # 只读预览配置和题目数量，不查询或启动 GPU。
-bash scripts/p1-run.sh --run runs/p1/pilot-train-v3 --dry-run
+bash scripts/p1-run.sh --run runs/p1/pilot-train-v4 --dry-run
 # 启动真实模型实验，使用新的输出目录。
-bash scripts/p1-run.sh --run runs/p1/pilot-train-v3
+bash scripts/p1-run.sh --run runs/p1/pilot-train-v4
 ```
 
 已有运行目录需显式 `--resume`；允许更换生成/评测卡号、卡数及并发/编译槽数，其余配置及 manifest 保存的源码指纹须一致；本次修复后应新建 run，不混合新旧结果。默认配置为 single/Agent 窗口 32768/131072、200 turns、temperature=0.7/top_p=0.95；没有额外的 4096 token 单次输出默认上限或 30 分钟轨迹上限。其余条件见报告与 `configs/p1-pilot.json`。
@@ -61,7 +61,7 @@ single 完成而 agent 中断时仍保留参数。`--prepare-only` 保留有效�
 ```bash
 conda activate .runtime/conda/learner
 # 指定正在运行的目录，仅查询状态，不启动 GPU。
-PYTHONPATH=src python -B -m p1.status --run runs/p1/pilot-train-v3
+PYTHONPATH=src python -B -m p1.status --run runs/p1/pilot-train-v4
 ```
 
 ## 数据审计从哪里来

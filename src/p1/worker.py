@@ -18,6 +18,7 @@ import time
 import traceback
 import numpy as np
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 # 保存 CUDA 同步函数的引用；调用时等待当前设备的 CUDA 工作完成。
 SYNC = torch.cuda.synchronize
@@ -36,6 +37,78 @@ class ReferenceValidationError(ValueError):
         """输入原因代码与可读诊断；供 main 写入阶段结果，无返回值。"""
         super().__init__(message)
         self.kind = kind
+
+
+class StorageLimitError(ValueError):
+    """单个输出或本题参数快照超过已声明预算，避免继续写入大文件。"""
+
+
+class RuntimeFallbackError(ValueError):
+    """模型实际调用了既定允许表以外的 ATen 计算。"""
+
+    def __init__(self, names):
+        """输入违规算子名；保存列表，供 main 写入候选失败证据。"""
+        super().__init__("PyTorch compute fallback: " + ", ".join(names))
+        self.names = names
+
+
+def storage_bytes(value):
+    """输入张量树；返回去重后的底层存储字节数，视图按实际被序列化的存储计数。"""
+    storages = {}
+
+    def collect(tensor):
+        """输入一片张量；登记其底层存储，返回原张量，不改变计算结果。"""
+        storage = tensor.untyped_storage()
+        storages[(str(tensor.device), storage._cdata)] = storage.nbytes()
+        return tensor
+
+    tree(value, collect)
+    return sum(storages.values())
+
+
+def save_limited(value, path, limit):
+    """输入 CPU 张量树、目标路径和剩余字节预算；有界写出，成功返回文件字节数。
+
+    先检查张量存储，再限制序列化器的每次 write；元数据也计入最终文件上限。
+    超限时删除半成品并抛 StorageLimitError，不留下可被控制器误读的发布文件。
+    """
+    path = Path(path)
+    if storage_bytes(value) > limit:
+        raise StorageLimitError(f"tensor storage exceeds {limit} bytes")
+
+    class BoundedWriter:
+        """限制 torch.save 写入总长度；不依靠写完之后才发现文件过大。"""
+
+        def __init__(self, stream):
+            """输入新建文件对象；记录文件和是否发生超限，无返回值。"""
+            self.stream = stream
+            self.exceeded = False
+
+        def write(self, data):
+            """输入待写字节；检查文件末端后写入并返回写入长度。"""
+            if self.stream.tell() + len(data) > limit:
+                self.exceeded = True
+                raise StorageLimitError(f"serialized file exceeds {limit} bytes")
+            return self.stream.write(data)
+
+        def flush(self):
+            """无输入；把序列化缓冲写入文件，无返回值。"""
+            self.stream.flush()
+
+    try:
+        with path.open("wb") as stream:
+            writer = BoundedWriter(stream)
+            try:
+                SAVE(value, writer)
+            except Exception:
+                # ZIP 收尾异常可能覆盖 write 的异常；仍保留明确的容量超限归因。
+                if writer.exceeded:
+                    raise StorageLimitError(f"serialized file exceeds {limit} bytes") from None
+                raise
+        return path.stat().st_size
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
 
 
 # 返回两个布尔值，顺序固定为矩阵乘法 TF32、cuDNN TF32，供执行前后对照。
@@ -176,7 +249,13 @@ def prepare(cfg):
         # 实例化题目的原始 Model，切到推理模式并移动到 GPU。
         m = mod.Model(*init).eval().cuda()
         # 只保存 CPU 权重；BrosConfig 等构造参数按相同种子从可信参考接口重建，避免不安全 pickle。
-        SAVE({"state": cpu(m.state_dict())}, out / "input-spec" / f"state-{s}.pt")
+        # 同题全部参数快照共享这份预算；它与逐例输出预算分别计算，不是显存限制。
+        target = out / "input-spec" / f"state-{s}.pt"
+        limit = cfg.get("case_storage_limit_bytes", 8 * 1024**3)
+        used = sum(p.stat().st_size for p in target.parent.glob("state-*.pt") if p != target)
+        if used + storage_bytes(m.state_dict()) > limit:
+            raise StorageLimitError(f"reference parameter snapshots exceed {limit} bytes")
+        save_limited({"state": cpu(m.state_dict())}, target, limit - used)
         # 先检查初始化、非有限值与确定性；更完整的输入验收在候选评测阶段执行。
         outputs = []
         # 用两个固定输入种子检查参考行为。
@@ -330,9 +409,9 @@ def compile_candidate():
                 staged_path = renamed
             staged_sources.append(staged_path)
         sources = staged_sources
-    # 至少要求存在一个 .cu 文件，避免完全没有 CUDA 源码的提交进入编译。
-    if not any(p.suffix == ".cu" for p in sources):
-        raise ValueError("no CUDA source")
+    # 合法 cuBLAS/cuDNN GPU 包装可能只有 .cpp；仍要求 kernels 下存在实现/绑定源码。
+    if not any(path.parent.name == "kernels" for path in sources):
+        raise ValueError("no kernel CUDA/C++ source")
     # 从实际导入的 torch 路径定位 kernel 环境的 site-packages。
     site = Path(torch.__file__).resolve().parents[1]
     # 允许扩展使用该环境中 NVIDIA cuDNN/cuBLAS 包提供的头文件。
@@ -508,6 +587,17 @@ def runtime_fallbacks(event_names):
     )
 
 
+class FallbackGuard(TorchDispatchMode):
+    """复用既定 ATen 允许表，覆盖当前模型调用里的每个可分派运算。"""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        """输入 PyTorch 算子及实参；违规时抛错，否则原样调用并返回结果。"""
+        forbidden = runtime_fallbacks([func._schema.name])
+        if forbidden:
+            raise RuntimeFallbackError(forbidden)
+        return func(*args, **(kwargs or {}))
+
+
 # cfg 提供计时与容差配置，candidate 决定测原始模型还是候选；返回测时和审计字典。
 def bench(cfg, candidate=False):
     """输入配置和是否候选；返回 eager/compile 或候选耗时、profile、精度状态和运行期回退。"""
@@ -627,6 +717,13 @@ def stream(cfg, phase, candidate):
     # 规定这两个标志的期望初始值，与 settings 保持一致。
     before = [True, True]
 
+    def checked_call(model, inputs):
+        """输入模型与一组输入；在原验算调用上检查回退，不另跑一遍模型。"""
+        if candidate:
+            with FallbackGuard():
+                return call(model, inputs)
+        return call(model, inputs)
+
     # label 是案例 ID，value 是输出树；发布一例输出并等待宿主确认，无返回值。
     def emit(label, value):
         """输入案例标签和输出值；原子写文件并等待外部确认，累积检查次数，返回 None。"""
@@ -639,7 +736,11 @@ def stream(cfg, phase, candidate):
         tmp = channel / "item.tmp"
         # 输出先转 CPU，再与案例 ID 一起序列化；参考和候选各有独立的输出挂载目录。
         progress("serialize_output", label)
-        SAVE({"id": label, "output": cpu(value)}, tmp)
+        limit = cfg.get("case_storage_limit_bytes", 8 * 1024**3)
+        # 先在 GPU 输出上估算，避免超大输出先复制到宿主内存；写文件仍有独立硬检查。
+        if storage_bytes(value) > limit:
+            raise StorageLimitError(f"output tensor storage exceeds {limit} bytes")
+        save_limited({"id": label, "output": cpu(value)}, tmp, limit)
         # 在同一目录原子替换为 item.pt，表示这份输出已写完、可以读取。
         tmp.replace(target)
         progress("waiting_for_ack", label)
@@ -672,7 +773,7 @@ def stream(cfg, phase, candidate):
         inp = inputs_for(inpmod, case["input_seed"])
         progress("inference", case["id"])
         # 执行该案例的正常模型调用。
-        out = call(m, inp)
+        out = checked_call(m, inp)
         # 发布普通输出，等待外部逐例比较。
         emit(case["id"], out)
         # 这一例已被消费后，释放输出引用。
@@ -681,7 +782,7 @@ def stream(cfg, phase, candidate):
         if phase == "hidden":
             # 对同一模型实例和同一输入再次调用，检查重复调用结果。
             progress("inference", case["id"] + "-repeat")
-            repeated = call(m, inp)
+            repeated = checked_call(m, inp)
             # 用 -repeat 后缀区分这条比较记录。
             emit(case["id"] + "-repeat", repeated)
             del repeated
@@ -689,7 +790,7 @@ def stream(cfg, phase, candidate):
             perturb(inp)
             # 对改过内容的输入重新调用模型。
             progress("inference", case["id"] + "-changed")
-            changed = call(m, inp)
+            changed = checked_call(m, inp)
             # 用 -changed 后缀发布结果，外部参考端也执行相同变换并给出对应输出。
             emit(case["id"] + "-changed", changed)
             del changed
@@ -705,7 +806,7 @@ def stream(cfg, phase, candidate):
             # 根据案例种子重新生成原始输入，避免复用刚被 perturb 改过的输入。
             inp = inputs_for(inpmod, case["input_seed"])
             progress("inference", case["id"] + "-reordered")
-            out = call(m, inp)
+            out = checked_call(m, inp)
             # 用 -reordered 后缀发布乱序执行的结果。
             emit(case["id"] + "-reordered", out)
         # 选第一个初始化对应的同一模型实例，继续测试重新加载参数。
@@ -720,7 +821,7 @@ def stream(cfg, phase, candidate):
             inp = inputs_for(inpmod, case["input_seed"])
             # 运行重新加载参数后的模型。
             progress("inference", case["id"] + "-reloaded")
-            out = call(m, inp)
+            out = checked_call(m, inp)
             # 用 -reloaded 后缀发布结果，与外部参考输出对应。
             emit(case["id"] + "-reloaded", out)
     # 所有输出得到外部确认后，返回本次流式执行的摘要。
@@ -805,6 +906,13 @@ def main():
             result.update(failure_kind="missing_dependency", missing_module=getattr(e, "name", None))
         elif isinstance(e, ReferenceValidationError):
             result["failure_kind"] = e.kind
+        elif isinstance(e, StorageLimitError):
+            result["failure_kind"] = "storage_limit"
+        elif isinstance(e, RuntimeFallbackError):
+            result["runtime_fallbacks"] = e.names
+        elif isinstance(e, OSError) and e.errno in {28, 122}:
+            # 磁盘/配额不足是环境问题，区别于候选超过事先约定的单输出上限。
+            result["failure_kind"] = "storage_unavailable"
     # 与控制器使用相同的阶段文件名；宿主读取后会在同一文件补上 controller_seconds。
     result_name = {
         "reference_prepare": "prepare_result.json",

@@ -161,11 +161,14 @@ def audit_contract(directory):
 
         check_function(methods["forward"], set())
 
-    sources = list((directory / "kernels").glob("*.cu")) + list(
-        (directory / "kernels").glob("*.cpp")
+    # 厂商库的合法 GPU 实现可以只有 C++ 包装；是否计算回退由调用审查和运行期检查判断。
+    sources = sorted(
+        path for path in (directory / "kernels").glob("*")
+        if path.suffix in {".cu", ".cpp", ".h", ".cuh"} and path.is_file()
     )
-    if not any(path.suffix == ".cu" for path in sources):
-        issues.append("missing kernels/*.cu")
+    if not any(path.suffix in {".cu", ".cpp"} for path in sources):
+        issues.append("missing kernels CUDA/C++ source")
+    # 头文件也可能包含真正的实现，不能只检查 include 它的 .cu/.cpp 文件。
     for path in sources:
         raw = path.read_text(encoding="utf-8")
         # 先去掉注释，避免注释里的 torch::matmul 被误识别为实际回退。

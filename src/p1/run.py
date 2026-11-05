@@ -46,7 +46,8 @@ Calling an existing nn.Module's forward is also a PyTorch compute fallback.
 Use raw CUDA kernels; cuBLAS only for GEMM and cuDNN only for convolution are allowed.
 Never alter global precision or evaluation state. Both reference and candidate allow
 TF32; atol=rtol=1e-2. Do not cache outputs for input values.
-Implement model_new.py plus kernels/*.cu and *_binding.cpp. The supplied binding.cpp
+Implement model_new.py plus CUDA/C++ sources under kernels/ and *_binding.cpp.
+Allowed cuBLAS GEMM/cuDNN convolution wrappers may use C++ without a .cu file. The supplied binding.cpp
 and binding_registry.h are fixed: do not return or overwrite these files.
 Include ../binding_registry.h and register bindings with REGISTER_BINDING(name, function).
 Use torch/types.h and torch/csrc/utils/pybind.h, c10::cuda::getCurrentCUDAStream(),
@@ -206,6 +207,8 @@ class Pilot:
         )
         result = {
             "text": res.text,
+            # 与每轮生成统计一同留证，便于确认实际请求没有再派生其他种子。
+            "seed": seed,
             "prompt_tokens": len(ids),
             "completion_tokens": len(res.token_ids),
             "finish_reason": res.finish_reason,
@@ -451,7 +454,8 @@ class Pilot:
                 g = self.generate(
                     messages,
                     mode == "agent",
-                    self.cfg["seed"] + index * 1000 + turn,
+                    # 每次生成使用同一个配置种子，不随题单位置或交互轮次变化。
+                    self.cfg["seed"],
                 )
                 turn_log.generation(g)
                 tokens += g["completion_tokens"]

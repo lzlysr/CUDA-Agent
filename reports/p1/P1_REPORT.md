@@ -89,19 +89,19 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 
 ## 4. 当前模型生成配置
 
-配置来源为 `configs/p1-pilot.json`。下表按文件顺序列出当前全部 39 个字段。
-2026-11-05 增加同卡并发、CPU 编译槽及生成引擎性能开关；未修改模型、提示词、采样值、上下文、轮数、容差和验收预算。当前 GPU 编号及 5% 漂移阈值沿用本次工作开始前的用户配置。
+配置来源为 `configs/p1-pilot.json`。下表按文件顺序列出当前全部 38 个字段。
+2026-11-05 当前配置采用固定生成 seed、1×10 稳态测时及候选之后的参考基线；不再设置基线漂移门槛。GPU 与并发值按当前配置同步，历史实验仍以各自 manifest 为准。本次修复详见第 22 节。
 
 | 字段 | 当前值 | 含义及生效方式 |
 |---|---|---|
-| `seed` | `42` | 数据抽样及模型采样的基础种子；每题/每轮由控制器派生，不是 CUDA 输入种子的总称。 |
+| `seed` | `42` | 数据抽样及每次模型生成的固定种子；不叠加题号或轮次。CUDA 验算输入沿用另一组固定且彼此不同的种子。 |
 | `pilot_tasks` | `12` | 数据准备时从 train 抽取的 pilot 题数；运行时 --task-id 可进一步选子集。 |
 | `model` | `"models/Qwen3.5-9B"` | 项目根目录下的原生 Qwen3.5-9B 模型目录，使用 BF16 权重推理。 |
 | `model_revision` | `"c202236235762e1c871ad0ccb60c8ee5ba337b9a"` | 模型来源版本追溯信息，不会在启动时联网下载。 |
 | `dataset_revision` | `"44a734c78c947bfcba5189cbfd13f57a6d29a698"` | Ops-6K 数据来源版本追溯信息。 |
 | `kernelbench_revision` | `"423217d9fda91e0c2d67e4a43bf62f96f6d104f1"` | KernelBench 来源版本追溯信息，不自动运行 KernelBench。 |
-| `generation_gpu` | `[0,2]` | 宿主生成卡编号或列表；每卡一个完整模型副本，同卡多个题共享该引擎，非张量并行。 |
-| `evaluation_gpu` | `[3,4]` | 宿主评测卡编号或列表；不与生成卡重合。正确性检查可同卡并发，正式性能测时独占。 |
+| `generation_gpu` | `[0,7]` | 宿主生成卡编号或列表；每卡一个完整模型副本，同卡多个题共享该引擎，非张量并行。 |
+| `evaluation_gpu` | `[4,5]` | 宿主评测卡编号或列表；不与生成卡重合。正确性检查可同卡并发，正式性能测时独占。 |
 | `docker_image` | `"sha256:d58d23b33e24c351dffc6b1bda93dcd7925e3832e2770da6b65e10abfdd05fa0"` | 固定评测镜像的内容摘要；模型在宿主 learner 中推理，隔离执行在该镜像内进行。 |
 | `context_tokens` | `131072` | Agent 总上下文窗口及引擎 max_model_len；含提示、历史、工具反馈和新输出。 |
 | `generation_tokens` | `null` | 每次输出的额外 token 上限；null 表示只受当轮剩余窗口限制。 |
@@ -115,22 +115,21 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 | `hidden_evaluation_seconds` | `600` | 隐藏流式验算容器总超时，单位秒；控制器另留 5 秒收尾。 |
 | `atol` | `0.01` | 数值比较绝对容差；与 rtol 一起判断，未因分块比较而放宽。 |
 | `rtol` | `0.01` | 数值比较相对容差；要求 abs(候选−参考) ≤ atol + rtol×abs(参考)。 |
-| `timing_iterations` | `30` | 每轮稳态测量执行次数；预热后轮换输入。 |
-| `timing_rounds` | `3` | 稳态测量轮数；轮内及轮间均取中位数。 |
-| `baseline_drift_limit` | `0.05` | 参考前后测相对漂移上限；当前 5%，超限按原逻辑重试后仍不合格则拒绝该次测时。 |
+| `timing_iterations` | `10` | 每轮稳态测量执行次数；预热后轮换输入。 |
+| `timing_rounds` | `1` | 稳态测量轮数；轮内及轮间均取中位数。 |
 | `feedback_cases` | `5` | 搜索反馈输入数；当前 5 次比较。 |
 | `hidden_cases_per_init` | `5` | 每个初始化的隐藏基础输入数；当前 5×2×3+4=34 次比较。 |
 | `hidden_init_seeds` | `[73001,73002]` | 隐藏检查的参数初始化种子，区别于语言模型采样种子。 |
-| `case_storage_limit_bytes` | `8589934592` | 参考参数快照的存储预算；共享内存可用空间选择也参考此值。 |
-| `protocol_version` | `"p1-paper-aligned-v3"` | manifest 中的追溯标识；字符串不自动切换评测逻辑，不代表论文全部复现。 |
+| `case_storage_limit_bytes` | `8589934592` | 单个在途输出文件上限；同题全部参数快照另以该值限制总量。双输出通道按两倍预算协作预留空间；不限制 GPU 显存，也不是宿主目录配额。 |
+| `protocol_version` | `"p1-paper-aligned-v4"` | manifest 中的追溯标识；字符串不自动切换评测逻辑，不代表论文全部复现。 |
 | `train_ratio` | `0.8` | 数据准备时的 train 比例，按规范化源码任务组划分；test 留作正式评测。 |
 | `pilot_split` | `"train"` | pilot 来源划分；当前为 train。 |
 | `single_context_tokens` | `32768` | single 总上下文窗口；含提示和一次输出，不额外补写格式失败的答案。 |
 | `shell_seconds` | `600` | 持久 Shell 命令硬上限；Bash 的前台等待 timeout 与此不同，等待结束可返回 bash_id。 |
 | `candidate_selection` | `"best_correct_speedup_compile"` | 当前固定候选选择策略的记录标签；正确且测时有效的候选按 compile 加速比排序，再做隐藏验收。 |
-| `generation_concurrency` | `{"0":2,"2":2}` | 每张生成卡同时推进的独立题数；支持统一正整数或按 GPU 编号的字典。无固定两题上限；同卡共享权重与动态批处理。 |
-| `evaluation_concurrency` | `{"3":2,"4":2}` | 每张评测卡最多同时运行的正确性检查作业数；支持正整数或逐卡字典。每个作业含参考/候选两个隔离容器，显存需求应一并考虑。正式性能测时不使用共享槽。 |
-| `compile_workers` | `2` | 全项目同时允许的 CPU 编译作业数，正整数；编译不占用评测卡。 |
+| `generation_concurrency` | `4` | 每张生成卡同时推进的独立题数；支持统一正整数或按 GPU 编号的字典。无固定两题上限；同卡共享权重与动态批处理。 |
+| `evaluation_concurrency` | `4` | 每张评测卡最多同时运行的正确性检查作业数；支持正整数或逐卡字典。每个作业含参考/候选两个隔离容器，显存需求应一并考虑。正式性能测时不使用共享槽。 |
+| `compile_workers` | `4` | 全项目同时允许的 CPU 编译作业数，正整数；编译不占用评测卡。 |
 | `enable_prefix_caching` | `true` | 是否启用生成引擎的公共提示前缀 KV 缓存；不缓存候选输出或隐藏答案。已通过本机双请求验证。 |
 | `enforce_eager` | `false` | true 强制模型推理 eager；false 允许 vLLM torch.compile/CUDA Graph。只作用于生成模型，不改变被测 PyTorch eager/compile 基线。 |
 
@@ -143,7 +142,7 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 3. **模型生成。** single 一次输出 JSON 多文件源码；agent 先分析原始性能，再使用文件和 Shell 工具开发、编译、验证和优化。
 4. **源码快照与实现合同。** 每次评测复制候选源码、记录哈希，检查路径、固定文件和实现约束。主要计算要求 raw CUDA，允许 cuBLAS GEMM、cuDNN 卷积；Python 仅承担分配、元数据和扩展调用，不允许 PyTorch 计算回退、`torch.compile`、Triton、精度状态修改或输出缓存投机。
 5. **编译与搜索反馈。** 用 nvcc 和 PyTorch 扩展构建工具面向 sm_80 编译。参考与候选在独立容器中重建相同输入和参数，严格加载 `state_dict`。外部控制器比较结构、shape、dtype、有限值及逐元素误差；搜索反馈使用 5 个输入，`atol=rtol=0.01`。
-6. **性能与奖励。** 正确候选才进入性能比较。候选计时前后重测基线，漂移超过 3% 时对同一快照重试一次，仍不稳定则不给有效加速比。零值、非有限或非正耗时不产生速度奖励。
+6. **性能与奖励。** 正确候选才进入性能比较。先测候选，再在同一张卡上测 eager 和 compile；只用这组后测基线计算加速比与奖励。不做前后平均或漂移拒绝/重试；零值、非有限或非正耗时仍不产生速度奖励。
 7. **选择最终候选。** 搜索候选与最终工作区一起参与选择；按相对 compile 的有效速度降序排列，源码去重后逐个隐藏验收，返回最快合格项。没有合格项则记录失败。
 8. **隐藏检查与汇总。** 隐藏验收使用 2 组初始化、每组 5 个输入，并检查重复调用、同地址内容变化、调用顺序及参数重载；隐藏结果不反馈给模型继续优化。记录最终正确性、有效速度、生成 token、累计 prefill token、工具调用和时间成本。
 
@@ -203,7 +202,7 @@ baseline 入口默认创建带时间戳的独立目录。这里的 `--limit 12` 
 ```bash
 cd /home/likun/junjxu/CUDA-Agent
 # 启动当前 train pilot，GPU 2 生成、GPU 3 评测；该命令会执行真实实验。
-bash scripts/p1-run.sh --run runs/p1/pilot-train-v3-seed42
+bash scripts/p1-run.sh --run runs/p1/pilot-train-v4-seed42
 ```
 
 首次运行使用新的输出目录。已有 manifest 的目录需要显式 `--resume`，且保存配置必须与当前配置完全一致；恢复时使用该 run 自己保存的题单。运行过程中不要修改其配置、源码或题单。
@@ -211,7 +210,7 @@ bash scripts/p1-run.sh --run runs/p1/pilot-train-v3-seed42
 ```bash
 conda activate /.runtime/conda/learner
 # 明确指定本次新 run，避免状态工具采用历史默认路径。
-PYTHONPATH=src python -B -m p1.status --run runs/p1/pilot-train-v3-seed42
+PYTHONPATH=src python -B -m p1.status --run runs/p1/pilot-train-v4-seed42
 ```
 
 上述示例仅说明操作方式；本次文档整理未替用户执行 GPU 命令，也不自动启动定时跟进、完整 test、KernelBench 或 P2 训练。
@@ -247,7 +246,7 @@ PYTHONPATH=src python -B -m p1.status --run runs/p1/pilot-train-v3-seed42
 | 候选选择 | 轨迹中对 compile 最快的正确解 | 按速度排序、去重并隐藏验收后选择 |
 | 正确性 | 搜索阶段五例反馈 | 五例反馈，另加本地隐藏检查及状态审计 |
 | 奖励 | -1/1/2/3 及 5% 时间下降门槛 | 采用对应里程碑；不更新权重 |
-| 性能统计 | 重复测量、平均等论文条件 | 本地采用三轮中位数及 3% 漂移门槛 |
+| 性能统计 | 重复测量、平均等论文条件 | 本地采用 1×10 次测量的中位数；只用候选之后的参考基线，无漂移门槛 |
 | 数据与硬件 | 论文训练流程、KernelBench 250 题、H20 验证池 | train pilot、A100、torch2.11+cu129 |
 | 训练 | 单轮 PPO、RFT/价值预训练、Agentic PPO | P1 不训练 |
 
@@ -528,7 +527,7 @@ baseline-<时间>/
 参考预检未通过时不会生成测时结果，也不会写入 `bench_result_path`；拒绝原因在预检详情文件中。若初始测时本身失败，仍保留 `bench_result_path` 指向失败记录。
 根目录不再嵌套完整 `detail`；成功题的详情路径指向 `bench_result.json`，拒绝题指向 `preflight.json`。
 Agent run 的根目录 `results.json` 同样只保留各题/模式的标量摘要和轨迹详情路径；完整轨迹结果仍在 `trajectories/<task_id>/<mode>/result.json`。
-各次额外参考测时（profile、前后基线）的阶段文件也统一使用 `bench_result.json`。
+各次额外参考测时（profile、候选之后的基线）的阶段文件也统一使用 `bench_result.json`。
 这些约定只用于后续运行，本次不迁移或删除已有 runs 结果。
 
 JSON 中关键性能字段：
@@ -577,7 +576,7 @@ bash scripts/p1-baseline.sh --task-id ops6k-00192d5b7124134b --gpu 3 --run runs/
 
 ### 11.12 这条入口的结论边界
 
-- 独立 baseline 没有执行候选路径的前后基线漂移审核、隐藏验收和速度奖励；baseline_drift_limit 不会在这里自动剔除漂移结果。
+- 独立 baseline 不执行候选生成、隐藏验收和速度奖励；候选评测现已取消前后基线漂移审核。
 - 当前 baseline 汇总主要按 worker 的 status 取数，记录的 TF32 状态变化也没有在该入口额外统一转为失败；完整的非正/非有限时间和状态审核主要位于候选评测路径。因此解读结果时仍应检查详细时间、compile_correct 和精度状态，不能仅见 status=ok 就视为覆盖所有测量有效性条件。
 - 预检、时钟、编译缓存及 PyTorch 版本都会影响测量；本次只测选定任务和当前机器，不代表全部 train/test 的平均水平。
 - 这次结果可以告诉你原始 PyTorch 和自动编译优化的性能起点，不能据此评估 Qwen 的 CUDA 编程能力或论文 RL 的提升。
@@ -720,7 +719,7 @@ scripts/p1-run.sh → src/p1/run.py:main
 | `src/p1/sandbox.py` | `BashProcess`、`SandboxSession` | 为一条 Agent 轨迹保留完整 Bash 会话状态；Shell 在无 GPU 容器中执行，GPU 请求通过受控 RPC 交回宿主。 |
 | `src/p1/agent_utils/` | `client.py`、`compile.py/compile.sh`、`verification.py`、`profiling.py` | 挂载到 Agent 的 `/workspace/utils`，接收命令行参数并请求宿主编译、正确性检查及性能分析；不是另一套判分代码。 |
 | `src/p1/evaluation.py` | `prepare/profile_reference`、`snapshot/compile_only` | 准备可信参考参数及起始性能，冻结候选源码、检查固定绑定并独立编译；候选自带 .so 不作为可信产物。 |
-| 同上 | `container/streamed_checks/evaluate`、`compare/reward` | 调度隔离容器，外部比较参考/候选数值；编译、正确性、前后基线与候选测时、漂移/状态审核及里程碑奖励在此串联。 |
+| 同上 | `container/streamed_checks/evaluate`、`compare/reward` | 调度隔离容器，外部比较参考/候选数值；编译、正确性、候选与后测基线、精度状态审核及里程碑奖励在此串联。 |
 | `src/p1/worker.py` | `settings/prepare/compile_candidate/runtime_fallbacks`；`timing/bench/profile_model/stream/main` | 容器内实际执行参数保存、CUDA 扩展编译、模型运行、CUDA event 测时、profiler 采样和输出流；宿主控制器读取结果后独立判定。 |
 | `src/p1/contract.py` | `audit_contract`、`contract` | 候选静态合同审核，区分明确违规与待复核提示；与 worker 的运行时限制配合使用。 |
 | `src/p1/helper/baseline_state.py` | `atomic_json`、锁、`cleanup_reference_artifacts`、归档与北京时间 | 复用安全写盘和锁；同题两模式保存后只删 input-spec 与 compile-cache，保留源码、阶段证据及完整轨迹。 |
@@ -752,7 +751,7 @@ scripts/p1-run.sh → src/p1/run.py:main
 
 生成采用**每卡一个完整 Qwen 副本，不同题并行**，每道题仍依次执行 single、agent；不是把一个模型拆到多卡。每张卡有 generation_concurrency 个题目槽，共享该卡模型；空闲槽领取下一题。固定题目索引和生成种子不随派发顺序变化。每个副本保留原来的上下文、采样与工具预算，不通过改变实验参数来提速。
 
-评测池一次租出一张卡给**完整作业**：例如一次 evaluate 的编译、参考/候选正确性检查、前后参考及候选测时均固定该卡；原正确性检查内部的两个流式容器仍可同时工作。嵌套调用和重试复用租约，不会各抢一张卡。参考预检按评测卡数并行。仅增加评测卡时，单模型的工具调用仍然顺序发生，吞吐提升主要来自预检；想并行生成不同题，需同时增加生成卡。
+当前编译使用独立 CPU 槽，不占 GPU；正确性阶段申请共享 GPU 租约，两个流式容器配对验算。性能阶段重新申请独占租约，候选和后测参考固定在同一张卡上顺序测量。参考预检按评测池调度；生成卡的异步引擎可并发推进多题。
 
 ```bash
 # 切换到服务器项目。
@@ -1191,3 +1190,78 @@ single 为 0/4，四条均因 invalid_output_format 失败。Agent 最终通过�
 15:33 的只读检查发现评测 GPU 3、4 有其他项目的高负载进程，但尚未确认这些进程是否覆盖 hardsigmoid 的测时区间，因此不能据此认定 8.94% 漂移的具体原因。后续工程侧需要关注测时稳定性；按用户要求，模型生成的数学、索引、边界及 API 错误只记录，不人工修补候选。
 
 本次收尾只核对已有结果并补充报告，没有调整阈值、重跑 GPU 或运行 CPU 回归。
+
+## 22. 后测基线、固定种子与奖励/资源边界修复（2026-11-05）
+
+本节为当前实现；第 14–21 节的历史运行继续按其原 manifest 和当时协议解释，不重算成绩。
+V8 已于北京时间 2026-11-05 21:57:05 完成，确认控制器结束后才部署本轮 worker 修改。
+
+### 22.1 生成与测时
+
+- 每个生成请求都使用配置 `seed=42`，不再叠加题单位置或 turn。实际 seed 写入 turn JSON 的 generation 统计；正确性输入仍使用固定且彼此不同的输入/初始化种子。
+- 测时顺序为候选 → eager → compile；只用同次评测的 `baseline_after` 计算两种 speedup 和离散奖励。不生成 `baseline-before`，不再计算前后平均，也不因漂移拒绝或重试。
+- 官方公开 `profiling.py` 采用上述先后顺序；论文未披露内部 PPO 服务的具体测量顺序，不能把这一调整说成已获内部源码验证。
+- 保留用户已设置的 `timing_rounds=1`、`timing_iterations=10`、TF32 公平性、预热、同步及独占测时。零/NaN/Inf 耗时仍不能打速度分；真实参考执行故障仍最多完整重试一次。
+- 配置删除 `baseline_drift_limit`，协议标记更新为 `p1-paper-aligned-v4`。旧 run 不以新协议续跑，需使用新目录。
+
+### 22.2 奖励的有效性与来源
+
+正式评测增加 `reward_valid`、`scored`、`reward_stage`、`failure_kind` 和 `reward_reason`。
+
+| 情况 | reward | reward_valid | 说明 |
+|---|---:|---|---|
+| 正式候选合同/编译/执行/数值失败 | -1 | true | 是可用于训练的候选失败，不能因负分就丢弃 |
+| 正确且有合法正耗时 | 1/2/3 | true | 依据同一组后测 eager/compile 基线打分 |
+| 仅编译工具 | null | false | 编译成功不表示正确，也没有性能奖励 |
+| 仅正确性验收成功 | 1 | false | 这个 1 仅保留工具阶段含义，不能覆盖性能阶段的 2/3 |
+| 参考故障、容器启动/依赖故障、无效计时 | null | false | 保留环境证据，不伪装为模型 -1 |
+
+`helper/rewards.py:training_reward` 只接收已明确标记的一次候选评测，可附同 hash 的隐藏验收。
+隐藏成功保留性能奖励，隐藏失败才归为该候选的失败；同候选身份不一致直接拒绝。
+它不接受根轨迹摘要，也不把 Agent 历史最佳候选奖励自动归到最终动作上。
+真正的补采、token 对齐、终止/截断及 Actor/Critic 更新仍由未来 P2 入口负责。
+
+### 22.3 源码与运行期审查
+
+- `contract.py` 同时检查 kernels 下 `.cu/.cpp/.h/.cuh`，防止实现藏进头文件后避开已有规则。
+- 取消必须有 `.cu` 的静态/编译限制，允许合法 cuBLAS GEMM/cuDNN 卷积的纯 C++ 包装；仍须存在 kernels 源码、固定绑定文件并通过全部检查。
+- `worker.py:FallbackGuard` 在每个原有验算调用上应用既定 ATen 允许表，包括五例反馈及隐藏重复/变更/乱序/权重重载检查，不额外重跑一套模型。
+- 不扩大或缩小此前确认的分配、元数据、复制等允许范围；性能 profiler 的检查也保留。分派监测覆盖实际经过 PyTorch dispatcher 的调用，不宣称能证明任意原生扩展绝无作弊。
+
+### 22.4 容量边界
+
+`case_storage_limit_bytes` 分别约束：①单个在途输出的序列化文件；②同题全部参数快照的总量。
+两者独立使用同一个配置值，当前各为 8 GiB，不是输入随机种子数量或 GPU 显存限制。
+
+worker 在复制/写出前估算底层张量存储，再在序列化器每次 write 时限制文件长度，元数据也计入。
+宿主在 `torch.load` 前检查普通文件、符号链接和实际大小，并通过已打开的文件描述符读取。
+双通道启动前按两倍单文件预算登记协作预留，跨项目内进程共享文件锁；临时目录与预留结束后释放。
+协作预留不是宿主文件系统配额，也不约束候选任意其他写入；外部进程耗尽磁盘仍按环境故障处理。
+候选超过事先声明的输出上限给 -1；参考超出预算不能归责给模型。
+
+### 22.5 在线 PPO 是否需要长期保存全部轨迹
+
+不需要。在线 PPO 的当前 batch 仍须在内存/临时存储里保留精确 token、prompt/动作 mask、旧策略概率、奖励及策略版本，供一次或多次 minibatch 更新使用，随后可以释放。
+旧概率也可在更新前由冻结 old actor 重算，但不能先更新模型再用新概率冒充旧概率。
+长期落盘的是按需调试/恢复证据及训练 checkpoint，不要求永久保存每个 batch。
+本轮不让 P1 额外生成 PPO 数据集，也不伪补历史日志缺失的 old logprob；P2 将通过 verl 在线采样和更新。
+
+### 22.6 验证
+
+新增手动入口 `tests/p1/gpu_alignment_smoke.py`，默认取配置中的第一张评测卡，不启动 Qwen。
+使用可信 cuBLAS C++ 夹具核对后测基线、34 次隐藏检查、奖励来源、头文件审查、第三组输入回退、有界序列化及参考参数总量。
+这些是工程验通数据，不混入 pilot 能力成绩；本轮不运行整套 CPU 回归。
+
+GPU 4 实测六项均通过，控制器使用 learner，容器内部使用原 kernel 环境，未安装或修改包：
+
+| 检查 | 实际结果 |
+|---|---|
+| 纯 C++ cuBLAS 与后测基线 | 无 `.cu` 的包装通过编译及五例比较；speedup 等于后测参考耗时/候选耗时，没有 baseline-before |
+| 奖励阶段与隐藏 | 34 次隐藏比较通过；隐藏成功保留原性能奖励，compile_only 不可作训练奖励 |
+| 头文件审查 | `.cuh` 中的 torch::matmul 被拒绝并给有效 -1 |
+| 后续输入回退 | 前两组调用正常，第三组 `aten::mm` 被运行期防线截获 |
+| 输出序列化上限 | 16 KiB 诊断预算下，候选超大元数据触发 StorageLimitError，记有效 -1 |
+| 参考参数总量 | 单份约 9,833 字节可保存，多份合计超过 16 KiB 时停止写出；参考不适用，无模型奖励 |
+
+证据：`.runtime/tmp/p1-alignment-20261105/validation.json` 及同名外部日志。
+验通入口最初误用缺少 pyarrow 的 kernel 环境，尚未启动 GPU 即退出，随后改用既有 learner；原启动错误日志单独保留，未通过安装包绕过问题。

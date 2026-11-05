@@ -20,9 +20,8 @@
   "hidden_evaluation_seconds": 600,
   "atol": 0.01,
   "rtol": 0.01,
-  "timing_iterations": 30,
-  "timing_rounds": 3,
-  "baseline_drift_limit": 0.10,
+  "timing_iterations": 10,
+  "timing_rounds": 1,
   "feedback_cases": 5,
   "hidden_cases_per_init": 5,
   "hidden_init_seeds": [
@@ -30,7 +29,7 @@
     73002
   ],
   "case_storage_limit_bytes": 8589934592,
-  "protocol_version": "p1-paper-aligned-v3",
+  "protocol_version": "p1-paper-aligned-v4",
   "train_ratio": 0.8,
   "pilot_split": "train",
   "single_context_tokens": 32768,

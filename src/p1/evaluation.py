@@ -18,7 +18,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import statistics
 import subprocess
 import time
 import uuid
@@ -29,7 +28,8 @@ from .data import ROOT, sha
 from .helper.baseline_state import atomic_json as dump
 from .helper.workspace import workspace_path
 from .helper.build_cache import build_identity, cache_lock, compilation_slot
-from .helper.stream_transport import stream_directories
+from .helper.stream_transport import checked_output, stream_directories
+from .helper.rewards import environment_failure, set_reward
 
 # 限制宿主 PyTorch 的 CPU 算子线程数，避免外部比较器占用过多 CPU。
 torch.set_num_threads(4)
@@ -175,6 +175,10 @@ class Evaluator:
         其他入口不传新增参数时，仍按 cfg 中 evaluation_gpu 选卡并生成公共配置。
         """
         self.cfg = cfg
+        # 容量是协议参数，配置非法应在启动容器前报错，不能把配置错误算作模型失败。
+        limit = cfg.get("case_storage_limit_bytes", 8 * 1024**3)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("case_storage_limit_bytes 必须为正整数")
         # 实际卡号属于宿主调度状态，不修改 cfg，也不要求写进每张卡自己的 JSON。
         self.gpu = cfg.get("evaluation_gpu", 7) if gpu is None else gpu
         self.run = Path(run)
@@ -284,7 +288,7 @@ class Evaluator:
             (self.config, "/config.json", "ro"),
             (out, "/outputs", "rw"),
         ]
-        # 参考性能测量专用缓存；同一题前后基线可以复用编译缓存，减少重复冷启动成本。
+        # 参考性能测量专用缓存；同题各次原始性能分析和后测基线复用编译缓存。
         if mode == "reference_bench" and reference is not None:
             cache = Path(reference) / "compile-cache"
             cache.mkdir(exist_ok=True)
@@ -583,8 +587,10 @@ class Evaluator:
             "audit_warnings": audit["warnings"],
             # 尚未编译和执行，正确性默认 False。
             "correct": False,
-            # 默认保留失败奖励占位；compile_only 会另用 scored=False 表明不计分。
-            "reward": -1,
+            # 尚未完成任何判定，不先放一个可能被误读为训练负奖励的 -1。
+            "reward": None,
+            "reward_valid": False,
+            "scored": False,
         }
         # 把静态阻断项单独返回给调用者，决定是否继续启动编译容器。
         return ev, snap, result, audit["issues"]
@@ -668,6 +674,8 @@ class Evaluator:
                     shutil.copy2(binary, destination)
                     # 只返回工作区相对文件名，不把参考输出或参考状态路径暴露给工具。
                     result["artifact"] = "cuda_extension.so"
+        # 仅编译工具无论成功或失败都不提供正式奖励。
+        set_reward(result, None, stage="compile_only", reason="not_a_scored_evaluation", valid=False)
         # 无论静态阻断还是编译结果，都为本次提交保存 result.json。
         dump(ev / "result.json", result)
         # 返回工具反馈；这个入口不做数值比较，也不做加速比测量。
@@ -752,6 +760,17 @@ class Evaluator:
         actual.mkdir()
         # 按实际配对顺序保存每一个案例的比较结论。
         checks = []
+        read_errors = {"reference": [], "candidate": []}
+
+        def read_item(path, role):
+            """输入通道文件及角色；检查普通文件/容量后读取，失败按角色保存证据。"""
+            try:
+                limit = self.cfg.get("case_storage_limit_bytes", 8 * 1024**3)
+                with checked_output(path, limit) as source:
+                    return torch.load(source, weights_only=True, mmap=True)
+            except Exception as error:
+                read_errors[role].append(str(error))
+                return None
         # 控制器循环也设总等待预算，避免无限等待输出握手。
         started = time.monotonic()
         # 隐藏验收使用独立的总墙钟预算，包含输入重建、输出传输、CPU 比较和握手等待。
@@ -796,9 +815,11 @@ class Evaluator:
                 if a.exists() and b.exists():
                     try:
                         # weights_only=True 限制反序列化可接受的对象，不使用允许任意对象的普通 pickle 加载。
-                        r = torch.load(a, weights_only=True, mmap=True)
+                        r = read_item(a, "reference")
                         # 读取候选的输出树；worker 发布前已把张量转到 CPU。
-                        c = torch.load(b, weights_only=True, mmap=True)
+                        c = read_item(b, "candidate")
+                        if r is None or c is None:
+                            raise ValueError("unreadable or oversized published output")
                         # 案例标签必须相同；顺序错乱属于评测协议错误，不能比较两份不同输入的输出。
                         if r["id"] != c["id"]:
                             raise InfrastructureError("stream case order differs")
@@ -839,6 +860,13 @@ class Evaluator:
                 time.sleep(0.01)
             # 取回两端最终状态；result() 会等待尚未完成的任务，并传播线程里的异常。
             rr, cr = rf.result(), cf.result()
+        # 参考文件不可读属于环境无法评分；候选文件不合规属于候选自身失败。
+        if read_errors["reference"]:
+            rr.update(status="error", failure_kind="reference_output_invalid",
+                      output_errors=read_errors["reference"])
+        if read_errors["candidate"]:
+            cr.update(status="error", error_type="InvalidCandidateOutput",
+                      output_errors=read_errors["candidate"])
         # 返回全部逐例检查与两端执行状态；最终通过条件由 evaluate 统一判断。
         return checks, rr, cr
 
@@ -896,15 +924,25 @@ class Evaluator:
         ev, snap, result, issues = self.snapshot(workspace)
         # 记录是否为最终隐藏验收，方便汇总时区分反馈结果与隐藏结果。
         result["final"] = final
+        result["reward_stage"] = "correctness" if final or not measure else "performance"
         # 第一道关：静态合同明确违规时，立即记录并返回，不编译、不执行。
         if issues:
             result.update(status="contract_violation", issues=issues)
+            set_reward(result, -1, stage="candidate_failure", failure_kind="candidate",
+                       reason="contract_violation")
             dump(ev / "result.json", result)
             return result
         compiled, build = self.compile_snapshot(snap, ev, result)
         result["compilation"] = compiled
         if compiled["status"] != "ok":
             result.update(status="compilation_failed")
+            if environment_failure(compiled):
+                set_reward(result, None, stage="environment", failure_kind="environment",
+                           reason="compilation_environment_failure", valid=False)
+                dump(ev / "result.json", result)
+                raise InfrastructureError("compilation environment failed; no model reward")
+            set_reward(result, -1, stage="candidate_failure", failure_kind="candidate",
+                       reason="compilation_failed")
             dump(ev / "result.json", result)
             return result
         # 正确性验算可并发；完成后释放卡，再申请独占性能测量。
@@ -915,8 +953,21 @@ class Evaluator:
             if attempt == 0:
                 return self.evaluate(task, snap, final, attempt=1, measure=measure)
             raise InfrastructureError("reference stream failed twice; do not assign model reward")
+        except OSError as error:
+            # 通道空间预留失败不能解释成 CUDA 数学错误，也不能给占位奖励。
+            set_reward(result, None, stage="environment", failure_kind="environment",
+                       reason="stream_storage_unavailable", valid=False)
+            result.update(status="infrastructure_error", error=str(error))
+            dump(ev / "result.json", result)
+            raise InfrastructureError("stream storage unavailable; no model reward") from error
         if not checked["correct"] or final or not measure:
-            checked["reward"] = 1 if checked["correct"] else -1
+            if checked["correct"]:
+                # 这一个 1 仅保留工具阶段含义，不可覆盖正式性能评测的 2/3。
+                set_reward(checked, 1, stage="correctness", valid=False,
+                           reason="correctness_only_not_performance_reward")
+            else:
+                set_reward(checked, -1, stage="candidate_failure", failure_kind="candidate",
+                           reason=checked.get("status") or "correctness_failed")
             dump(ev / "result.json", checked)
             return checked
         with self.gpu_operation(exclusive=True):
@@ -945,8 +996,18 @@ class Evaluator:
                 "reference": reference, "candidate": ran, "checks": checks,
                 "reference_health": result.get("stream_failure", {}).get("reference_health"),
             })
+            result.update(status="infrastructure_error", execution=ran, checks=checks)
+            set_reward(result, None, stage="environment", failure_kind="environment",
+                       reason="reference_stream_failed", valid=False)
+            dump(ev / "result.json", result)
             # 由 evaluate 在释放当前租约后完整重试，保持原来的测时/隐藏标记。
             raise _ReferenceStreamFailure("reference stream failed")
+        if environment_failure(ran):
+            result.update(status="infrastructure_error", execution=ran, checks=checks)
+            set_reward(result, None, stage="environment", failure_kind="environment",
+                       reason="candidate_container_environment_failure", valid=False)
+            dump(ev / "result.json", result)
+            raise InfrastructureError("candidate container environment failed; no model reward")
         # 精确核对预期比较次数，防止少执行案例或提前退出却因已通过的少量样例而获通过。
         expected_n = (
             # 反馈阶段每个案例只发布一次普通输出。
@@ -974,23 +1035,23 @@ class Evaluator:
                 and all(c["passed"] for c in checks)
                 # 没有被 worker 检出的精度状态变更，例如运行后修改 TF32 设置。
                 and not ran.get("state_mutations")
+                # 所有原有验算调用都启用回退检查，不能只查看第一组性能 profile。
+                and not ran.get("runtime_fallbacks")
             ),
         )
+        if ran.get("runtime_fallbacks"):
+            result.update(status="runtime_fallback_detected", runtime_fallbacks=ran["runtime_fallbacks"])
+        elif ran.get("state_mutations"):
+            result["status"] = "precision_state_violation"
+        elif not result["correct"]:
+            result["status"] = "correctness_failed"
         return result
 
     def _measure_candidate(self, task, snap, build, ev, result, final, attempt):
-        """输入数值正确候选；独占一张卡完成参考前测、候选、参考后测及漂移检查。"""
+        """输入正确候选；独占同一卡，先测候选再测参考，只用后测基线计算速度和奖励。"""
         ref = self.run / "references" / task["task_id"]
-        # 候选独占测时前后都重测参考基线，以检测资源干扰和计时漂移。
-        # 第四道关先测参考，再测候选，最后再测参考；三个调用依次执行而非同时测时。
-        before = self.container(
-            "reference_bench",
-            ev / "baseline-before",
-            reference=ref,
-            inputs=ref / "cases/input-spec",
-            timeout=300,
-        )
-        # 候选测时复用本次新构建的扩展，但在独立的新容器中进行。
+        result["baseline_policy"] = "after"
+        # 与公开 profiling.py 的先后顺序一致；候选与参考仍分容器，隔离 TF32 等状态。
         measured = self.container(
             "candidate_bench",
             ev / "timing",
@@ -998,7 +1059,30 @@ class Evaluator:
             inputs=ref / "cases/input-spec",
             build=build,
         )
-        # 候选结束后再测一次参考，用前后差异诊断 GPU 负载、频率或资源干扰带来的漂移。
+        result["timing"] = measured
+        if measured["status"] != "ok":
+            result.update(status="timing_failed", timing_valid=False)
+            if environment_failure(measured):
+                set_reward(result, None, stage="environment", failure_kind="environment",
+                           reason="timing_environment_failure", valid=False)
+                dump(ev / "result.json", result)
+                raise InfrastructureError("candidate timing environment failed; no model reward")
+            result["correct"] = False
+            set_reward(result, -1, stage="candidate_failure", failure_kind="candidate",
+                       reason="candidate_timing_failed")
+            dump(ev / "result.json", result)
+            return result
+        if measured.get("runtime_fallbacks") or measured.get("state_mutations"):
+            fallback = measured.get("runtime_fallbacks")
+            status = "runtime_fallback_detected" if fallback else "precision_state_violation"
+            result.update(status=status, correct=False, timing_valid=False)
+            if fallback:
+                result["runtime_fallbacks"] = fallback
+            set_reward(result, -1, stage="candidate_failure", failure_kind="candidate", reason=status)
+            dump(ev / "result.json", result)
+            return result
+
+        # 候选完成后再测 eager/compile；不生成 baseline-before，不算漂移，不为漂移重试。
         after = self.container(
             "reference_bench",
             ev / "baseline-after",
@@ -1006,104 +1090,39 @@ class Evaluator:
             inputs=ref / "cases/input-spec",
             timeout=300,
         )
-        # 参考前测或后测任一个失败，都不能计算可信的候选速度奖励。
-        if before["status"] != "ok" or after["status"] != "ok":
-            # 保存前后两次参考故障的原始结果。
-            dump(ev / "infrastructure-error.json", {"before": before, "after": after})
-            # 首次故障完整重试同一源码；第二次仍失败抛基础设施异常。
+        result["baseline_after"] = after
+        if after["status"] != "ok" or after.get("state_mutations"):
+            result.update(status="infrastructure_error", timing_valid=False)
+            set_reward(result, None, stage="environment", failure_kind="environment",
+                       reason="reference_timing_failed", valid=False)
+            dump(ev / "result.json", result)
+            dump(ev / "infrastructure-error.json", {"after": after})
+            # 参考执行故障仍可有限重试同一源码；这与已取消的漂移重试不同。
             if attempt == 0:
-                return self.evaluate(task, snap, final, attempt=1)
-            raise InfrastructureError("reference timing failed twice; do not assign model reward")
-        # 候选自身测时执行失败属于候选失败；与上方参考基础设施失败分开处理。
-        if measured["status"] != "ok":
-            # 标记 timing_failed 并令候选不合格，不保留先前数值通过带来的正奖励。
-            result.update(status="timing_failed", correct=False, reward=-1)
-            dump(ev / "result.json", result)
-            return result
-        # 动态 profiler 若发现不允许的 ATen 计算回退，即使输出正确也不能作为合规 CUDA 候选。
-        if measured.get("runtime_fallbacks"):
-            # 记录实际回退事件，方便区分真实 CUDA/允许库调用与 PyTorch 计算捷径。
-            result.update(
-                status="runtime_fallback_detected",
-                correct=False,
-                reward=-1,
-                runtime_fallbacks=measured["runtime_fallbacks"],
-            )
-            dump(ev / "result.json", result)
-            return result
-        # 收集 5 个 CUDA 毫秒数：候选一次，参考前后各 eager/compile 两次。
-        times = [measured["timing"]["cuda_ms"]] + [
-            baseline[key]["cuda_ms"] for baseline in [before, after] for key in ["eager", "compile"]
-        ]
-        # 每个耗时都必须是有限且严格大于 0 的数，先防止除零和虚假无限加速。
+                retried = self.evaluate(task, snap, final, attempt=1)
+                retried["retry_of"] = ev.name
+                return retried
+            raise InfrastructureError("reference timing failed twice; no model reward")
+
+        times = [measured["timing"]["cuda_ms"], after["eager"]["cuda_ms"], after["compile"]["cuda_ms"]]
         if any(
             not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
             for value in times
         ):
-            # 无效计时用 reward=None，表示不能拿来打速度分，而非把零耗时当成极快。
-            result.update(
-                status="invalid_timing",
-                timing_valid=False,
-                reward=None,
-                # 同时保留候选计时及前后基线，便于检查零值、NaN/Inf 等异常。
-                timing=measured,
-                baseline_before=before,
-                baseline_after=after,
-            )
-            # 无效数值计时直接返回该证据记录；下面的漂移重试只处理数值合法但漂移大的情况。
+            # 零、NaN、Inf 仍不是可用的测时数据，不用默认分数补齐。
+            result.update(status="invalid_timing", timing_valid=False)
+            set_reward(result, None, stage="environment", failure_kind="environment",
+                       reason="invalid_timing", valid=False)
             dump(ev / "result.json", result)
             return result
-        # 分别计算 eager 和 compile 的前后相对漂移绝对值：abs(后测/前测 - 1)。
-        drift = {
-            k: abs(after[k]["cuda_ms"] / before[k]["cuda_ms"] - 1) for k in ["eager", "compile"]
-        }
-        # 两种参考基线都必须不超过配置 baseline_drift_limit，才认可这次性能比较。
-        valid = max(drift.values()) <= self.cfg["baseline_drift_limit"]
-        # 无论漂移是否通过，都先把完整测时证据写入结果对象。
+
+        candidate_ms, eager_ms, compile_ms = times
         result.update(
-            baseline_before=before,
-            baseline_after=after,
-            # 保存 eager/compile 各自的漂移比例，便于定位是哪条基线不稳定。
-            baseline_drift=drift,
-            # timing_valid 单独表示测时可信度，不能与数值正确性 correct 混淆。
-            timing_valid=valid,
-            timing=measured,
+            timing_valid=True,
+            speedup_eager=eager_ms / candidate_ms,
+            speedup_compile=compile_ms / candidate_ms,
         )
-        # 候选在性能运行中也不能更改 TF32 等精度状态，防止只在测速时降低精度。
-        if measured.get("state_mutations"):
-            # 精度状态违规会令候选不合格并给 -1，即使此前正确性和耗时看起来正常。
-            result.update(correct=False, reward=-1, status="precision_state_violation")
-        # 只有数值正确、没有状态违规且基线稳定，才计算最终加速比和里程碑奖励。
-        elif valid:
-            # 分别用参考前/后两个 CUDA 耗时的中位数作为该基线的代表耗时。
-            baseline = {
-                # 这里恰好只有两个值，statistics.median 的结果等于它们的算术平均值。
-                k: statistics.median([before[k]["cuda_ms"], after[k]["cuda_ms"]])
-                for k in ["eager", "compile"]
-            }
-            # 取候选自身的 CUDA 毫秒数，不使用 controller_seconds 或编译首调时间。
-            ms = measured["timing"]["cuda_ms"]
-            # 加速比定义为参考耗时/候选耗时：大于 1 表示候选更快，小于 1 表示更慢。
-            result.update(
-                # 相对 PyTorch eager 的加速比。
-                speedup_eager=baseline["eager"] / ms if ms > 0 else None,
-                # 相对 torch.compile 的加速比；两种基线分别报告，不能混成一个数。
-                speedup_compile=baseline["compile"] / ms if ms > 0 else None,
-            )
-            # 在可信性能结果上按上方 reward 的严格耗时门槛赋予 1/2/3 奖励。
-            result["reward"] = reward(True, baseline["eager"], baseline["compile"], ms)
-        # 基线漂移过大时不打速度分，保留 None，避免噪声被当成模型能力。
-        else:
-            result["reward"] = None
-        # 先保存当前尝试，重试也不会覆盖这份原始故障/漂移证据。
+        # 同一组后测基线同时服务于 speedup 与式(1)奖励，严格使用耗时下降 >5% 的门槛。
+        set_reward(result, reward(True, eager_ms, compile_ms, candidate_ms), stage="performance")
         dump(ev / "result.json", result)
-        # 数值合法但漂移超限，且尚未重试时，允许对同一快照再做一次完整评测。
-        if not valid and attempt == 0:
-            # 重试复用候选源码身份，但重新编号、重新编译并重新执行各检查。
-            retried = self.evaluate(task, snap, final, attempt=1)
-            # 在返回对象中补上来源评测编号；此处不再次改写递归调用已经保存的 result.json。
-            retried["retry_of"] = ev.name
-            # 优先返回重试的结果，让上层看到最后一次尝试的结论。
-            return retried
-        # 正常完成或已经用过一次漂移重试后，返回当前结果；不会无限递归重试。
         return result
