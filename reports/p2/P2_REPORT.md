@@ -519,3 +519,21 @@ worker 日志仅输出阶段、状态、结果文件位置、耗时及错误/tra
 当前仍保存完整 Actor/Critic 模型、优化器、调度器/RNG 和数据游标。没有启用可能漏存
 Critic score 头的 LoRA-only 裁剪，也没有改动 max_checkpoints。
 本轮不启动 PPO/GPU 实验，不运行 CPU 回归套件；仅做语法、引用和持久化路径的静态核对。
+
+
+## 15. 2026-11-07：移除本地额外的 eager/compile 输出一致性门槛
+
+原先 worker.bench 在测完 compile 后，额外对五组输入比较 compiled 与 eager 输出，
+失败时令 reference_bench 返回 error；P2 把该预检失败上报为无法评分，严格采样器终止整批。
+这项检查是本地工程保护，论文未明确要求逐次执行，官方公开 profiling.py 也没有此断言。
+论文 §3.1 要求原算子在 Eager/Compile 模式成功执行；公开 verification.py 检查的是
+候选 CUDA 与原始 eager 输出，而非 eager 与 compile 相互比较。
+
+现删除额外断言及 compile_correct 字段，compile 仅提供性能参考，speedup_compile
+仍按 compile_ms/candidate_ms 计算。该比值本身不再额外证明 compile 输出与 eager 一致。
+原始 eager 继续作为候选正确性的参考；反馈/隐藏检查、容差、固定种子、后测基线、
+测时次数和奖励门槛均不变。编译/执行报错、非正/非有限耗时、状态污染仍按原规则处理。
+这不等于放宽候选验算，不给参考故障伪造 -1，也不放宽排序索引的比较标准。
+
+本次修改共用 worker，适用于后续 P1/P2 基线计时；旧实验文件及历史审查报告保持原样。
+未启动训练、单题 GPU 重放或 CPU 回归套件；仅核对语法、调用关系及移除字段的引用。

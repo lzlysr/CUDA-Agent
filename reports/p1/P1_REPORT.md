@@ -477,9 +477,9 @@ GPU 检查通过后，`run_baselines()` 新建输出目录。默认形如 `runs/
 
 **第三步，创建编译版本并记录首调。** 调用 `torch.compile(model, mode='default')`，执行第一组输入并等待 GPU 完成，记录 compile_first_call_seconds。这里可能包含首次编译、加载和第一次执行，因此单独保存，不混入之后的稳态时间；也不能保证是完全无缓存的冷编译。
 
-**第四步，测 compile 稳态。** 对 compiled 执行与 eager 相同的五组输入预热、30×3 次测量和中位数汇总。编译优化由 PyTorch 完成，可能生成或调用 CUDA/Triton 等内核；这不是 Agent 生成的候选。候选禁止 Triton 的实现合同不会施加到 torch.compile 参考基线上。
+**第四步，测 compile 稳态。** 对 compiled 执行与 eager 相同的五组输入预热、1 轮×10 次测量和中位数汇总。编译优化由 PyTorch 完成，可能生成或调用 CUDA/Triton 等内核；这不是 Agent 生成的候选。候选禁止 Triton 的实现合同不会施加到 torch.compile 参考基线上。
 
-**第五步，核对编译前后输出。** 对 5 组输入比较 compiled 与 eager 输出，使用 atol=rtol=0.01。通过后记录 compile_correct=true；比较失败则 worker 返回 error，该题不以成功性能结果汇总。当前代码是在稳态测量之后做此比较，但最终成功记录必须通过它。
+**第五步，明确基线用途。** 按官方 profiling.py，compile 仅提供性能参考，不再额外比较 compiled 与 eager 输出，也不生成 compile_correct 字段。候选实现仍须通过与原始 eager 输出的独立正确性检查；基线编译/运行异常及无效测时仍按原规则处理。
 
 **第六步，另做性能分析。** 分别对 eager、compile 的第一组输入运行一次 profiler，记录调用名、调用次数和 device_us 等统计。profiler 在正式计时之后独立运行，其耗时不混入稳态结果。名称和占比有助于解释是否存在融合、调度或大算子瓶颈，但一次采样不足以证明完整性能原因。
 
@@ -539,7 +539,6 @@ JSON 中关键性能字段：
 | `eager_wall_ms` / `compile_wall_ms` | 两种执行方式的同步墙钟耗时，毫秒 |
 | `compile_over_eager_speedup` | eager_cuda_ms ÷ compile_cuda_ms；大于 1 表示 compile 更快 |
 | `compile_first_call_seconds`（详情文件） | 编译包装及首调耗时，秒，注意与 ms 的单位区别 |
-| `compile_correct`（详情文件） | 编译前后输出比较是否通过 |
 | `profiles`（详情文件） | eager/compile 的算子或事件统计，device_us 使用微秒 |
 | `tf32_before/after`、`state_mutations`（详情文件） | 精度状态记录 |
 | `controller_seconds`（详情文件） | 该测量容器从启动至收尾的控制器墙钟时间，不是单次 kernel 时间 |
@@ -577,7 +576,7 @@ bash scripts/p1-baseline.sh --task-id ops6k-00192d5b7124134b --gpu 3 --run runs/
 ### 11.12 这条入口的结论边界
 
 - 独立 baseline 不执行候选生成、隐藏验收和速度奖励；候选评测现已取消前后基线漂移审核。
-- 当前 baseline 汇总主要按 worker 的 status 取数，记录的 TF32 状态变化也没有在该入口额外统一转为失败；完整的非正/非有限时间和状态审核主要位于候选评测路径。因此解读结果时仍应检查详细时间、compile_correct 和精度状态，不能仅见 status=ok 就视为覆盖所有测量有效性条件。
+- 当前 baseline 汇总主要按 worker 的 status 取数，记录的 TF32 状态变化也没有在该入口额外统一转为失败；完整的非正/非有限时间和状态审核主要位于候选评测路径。因此解读结果时仍应检查详细时间和精度状态，不能仅见 status=ok 就视为覆盖所有测量有效性条件。
 - 预检、时钟、编译缓存及 PyTorch 版本都会影响测量；本次只测选定任务和当前机器，不代表全部 train/test 的平均水平。
 - 这次结果可以告诉你原始 PyTorch 和自动编译优化的性能起点，不能据此评估 Qwen 的 CUDA 编程能力或论文 RL 的提升。
 

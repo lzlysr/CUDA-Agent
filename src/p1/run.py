@@ -301,7 +301,6 @@ class Pilot:
             "eager",
             "compile",
             "compile_first_call_seconds",
-            "compile_correct",
             "profiles",
             "profile",
             "runtime_fallbacks",

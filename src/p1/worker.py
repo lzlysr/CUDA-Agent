@@ -652,14 +652,8 @@ def bench(cfg, candidate=False):
         result["compile_first_call_seconds"] = CLOCK() - started
         # 再通过相同 timing 流程测量编译模型的稳态性能。
         result["compile"] = timing(compiled, samples, cfg)
-        # 基线本身也要核对语义；编译/首调成本与稳态 kernel 时间分开报告。
-        # 对每组样本核对编译模型与 eager 模型，确认基线本身也保持题目语义。
-        for sample in samples:
-            torch.testing.assert_close(
-                call(compiled, sample), call(model, sample), atol=cfg["atol"], rtol=cfg["rtol"]
-            )
-        # 只有全部样本的编译/eager 比较都通过，才写入 compile_correct=True。
-        result["compile_correct"] = True
+        # 与官方 profiling.py 一致：compile 在这里仅提供性能基线，不与 eager 比较输出。
+        # 候选正确性仍由独立的流式验算对照原始 eager 输出；不改变其容差或案例数。
         result["profiles"] = {
             "eager": profile_model(model, samples[0])[0],
             "compile": profile_model(compiled, samples[0])[0],

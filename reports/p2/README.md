@@ -68,3 +68,7 @@ vLLM 使用原生 `enable_tower_connector_lora` 加载视觉适配器；任务�
 阶段详情及候选源码继续保存在 kernel/evaluations 下。
 参考预检仅落盘采样摘要；worker 日志不再重复打印整份结果 JSON。
 检查点保留数量未调整；旧运行文件不迁移、不删除。完整说明见报告第 14 节。
+
+参考测时按官方 profiling.py 执行：eager 与 compile 分别计时，不额外要求二者输出一致。
+候选正确性仍以原始 eager 输出为准；不改变五组训练反馈、隐藏验收、容差及奖励门槛。
+历史 compile_correct 字段不再生成；基线执行失败、无效耗时仍不能用于评分。
