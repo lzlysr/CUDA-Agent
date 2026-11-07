@@ -5,6 +5,7 @@
 不要在宿主直接运行；CPU 单测只导入纯辅助函数，不调用 GPU。"""
 
 import argparse
+import hashlib
 from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
@@ -362,11 +363,24 @@ def prepare(cfg):
         constant = all(
             abs(v - anchor) <= cfg["atol"] + cfg["rtol"] * abs(anchor) for a in arrays for v in a
         )
+    # 所有确定性/近常数判定已使用完整采样完成；落盘只保存摘要，不重复存数千个浮点数。
+    for entry in metadata:
+        for audits in entry["output_audits"]:
+            for audit in audits:
+                values = audit.pop("sample")
+                audit.update(
+                    sample_count=len(values),
+                    sample_min=min(values) if values else None,
+                    sample_max=max(values) if values else None,
+                    sample_sha256=hashlib.sha256(
+                        json.dumps(values, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest(),
+                )
     # 返回准备阶段的审计结果，供宿主决定是否接受这道题。
     return {
         # 这是基于采样值的近常数标记，宿主据此过滤退化题。
         "near_constant_sampled_output": constant,
-        # 保留上述逐初始化、逐输入的输出审计。
+        # 保留逐初始化、逐输入的形状、dtype 和采样摘要。
         "metadata": metadata,
         # 反馈阶段的基础案例数量。
         "cases_feedback": len(case_list("feedback", cfg)),
@@ -919,7 +933,12 @@ def main():
         "reference_bench": "bench_result.json",
     }.get(a.mode, "result.json")
     (Path("/outputs") / result_name).write_text(json.dumps(result, indent=2))
-    print(json.dumps(result))
+    # 详情已在 JSON 中保存；终端只输出阶段摘要与错误，避免 worker.log 重复整份结果。
+    summary = {"mode": a.mode, "phase": a.phase, "result_file": result_name}
+    for key in ("status", "elapsed_seconds", "error_type", "error", "traceback", "failure_kind"):
+        if key in result:
+            summary[key] = result[key]
+    print(json.dumps(summary), flush=True)
     return 0 if result["status"] == "ok" else 1
 
 

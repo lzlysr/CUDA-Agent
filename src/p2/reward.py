@@ -13,20 +13,81 @@ import uuid
 from p2.common import ROOT, now, write_json
 
 
+def compact_evaluation_result(run, evaluation):
+    """输入 P2 run 与完整内存评测结果；精简磁盘总结果，返回相对 run 的结果路径。
+
+    奖励仍使用未修改的 evaluation；阶段详情保存在原文件中，总结果只存路径引用。
+    此函数仅由 P2 调用，不改变 P1 的返回值或默认输出格式。
+    """
+    run = Path(run).resolve()
+    directory = run / "kernel/evaluations" / str(evaluation["evaluation_id"])
+    if directory.resolve().parent != (run / "kernel/evaluations").resolve():
+        raise ValueError("评测结果目录超出本次 run")
+    path = directory / "result.json"
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    details = {}
+    for field, relative in (
+        ("compilation", "compilation/result.json"),
+        ("execution", "candidate-stream/result.json"),
+        ("reference_execution", "reference-stream/result.json"),
+        ("timing", "timing/result.json"),
+        ("baseline_after", "baseline-after/bench_result.json"),
+    ):
+        detail = directory / relative
+        if detail.is_file():
+            # 控制器可能补充传输方式等字段；先合入阶段文件，再移除总结果副本。
+            if isinstance(summary.get(field), dict):
+                record = json.loads(detail.read_text(encoding="utf-8"))
+                record.update(summary.pop(field))
+                write_json(detail, record)
+            details[field] = detail.relative_to(run).as_posix()
+    summary["detail_paths"] = details
+    summary["candidate_path"] = (directory / "candidate").relative_to(run).as_posix()
+    write_json(path, summary)
+    return path.relative_to(run).as_posix()
+
+
+def cleanup_candidate_workspace(request, candidate):
+    """输入本次样本目录和可信候选快照；仅在全部源码已有相同副本时删除工作区。
+
+    返回是否删除。未形成完整快照、含符号链接或内容不一致时保留现场，便于排查。
+    调用方必须先保存样本结果，并确认反馈评测及可选隐藏验收均已结束。
+    """
+    request = Path(request).resolve()
+    workspace = request / "workspace"
+    candidate = Path(candidate)
+    if not workspace.is_dir() or workspace.is_symlink() or not candidate.is_dir():
+        return False
+    if workspace.resolve().parent != request:
+        raise ValueError("清理工作区超出本次样本目录")
+    paths = list(workspace.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        return False
+    sources = [path for path in paths if path.is_file()]
+    for source in sources:
+        snapshot = candidate / source.relative_to(workspace)
+        if not snapshot.is_file() or snapshot.read_bytes() != source.read_bytes():
+            return False
+    if not sources:
+        return False
+    shutil.rmtree(workspace)
+    return True
+
+
 def evaluate_response(config, response, task, hidden=False):
     """输入项目配置、原始输出和训练/验证任务；返回 verl 标量奖励及审查索引。
 
-    每次请求独立保存生成源码和结果；同题请求持锁保护参考输入，测速独占评测卡。
-    完成后清理 input-spec、compile-cache；代码/日志和后测基线记录继续保留。
+    每次请求保存原始回答和结果索引；源码只长期保留评测快照，完整快照写好后清理工作区。
+    同题请求持锁保护参考输入，测速独占评测卡；继续清理 input-spec、compile-cache。
     """
-    from p1.evaluation import Evaluator, InfrastructureError
+    from p1.evaluation import InfrastructureError
     from p1.helper.baseline_state import cleanup_reference_artifacts
     from p1.helper.pilot_parallel import EvaluationPool, ParallelEvaluator, blocking_lock
     from p1.helper.rewards import training_reward
     from p1.helper.tool_calls import parse_single
     from p1.run import write_files
 
-    run = Path(config["run"])
+    run = Path(config["run"]).resolve()
     request = run / "samples" / uuid.uuid4().hex
     request.mkdir(parents=True)
     (request / "response.txt").write_text(response, encoding="utf-8")
@@ -35,6 +96,7 @@ def evaluate_response(config, response, task, hidden=False):
     # 初始化只写独立工作区；公共配置由训练入口创建，避免多 reward worker 相互覆盖。
     pool = EvaluationPool(cfg["evaluation_gpu"], run / "scheduler", cfg=cfg)
     evaluator = ParallelEvaluator(cfg, evaluator_run, pool)
+    evaluation = acceptance = None
     try:
         try:
             files = parse_single(response)
@@ -64,8 +126,23 @@ def evaluate_response(config, response, task, hidden=False):
                         raise InfrastructureError(f"评测返回无效奖励：{result}")
                 finally:
                     cleanup_reference_artifacts(evaluator_run, task["task_id"])
-        result.update(task_id=task["task_id"], hidden=hidden, created_at=now().isoformat())
+        # 先由完整内存结果计算奖励，再精简持久化详情；反馈与隐藏验收分别索引。
+        feedback_path = compact_evaluation_result(run, evaluation) if evaluation is not None else None
+        acceptance_path = compact_evaluation_result(run, acceptance) if acceptance is not None else None
+        result.update(
+            sample_id=request.name, task_id=task["task_id"], hidden=hidden,
+            correct=bool(result.get("correct", False)), created_at=now().isoformat(),
+            response_path=(request / "response.txt").relative_to(run).as_posix(),
+            feedback_result_path=feedback_path, acceptance_result_path=acceptance_path,
+        )
         write_json(request / "result.json", result)
+        if feedback_path is not None:
+            # 结果及源码快照落盘之后才清理；失败时保留工作区，不改变已经算出的奖励。
+            try:
+                cleanup_candidate_workspace(request, (run / feedback_path).parent / "candidate")
+            except OSError as error:
+                result["workspace_cleanup_error"] = str(error)
+                write_json(request / "result.json", result)
         return {"score": result["reward"], "acc": int(result.get("correct", False)),
                 "reward_valid": True, "hidden": hidden, "detail": str(request / "result.json")}
     except Exception as error:
