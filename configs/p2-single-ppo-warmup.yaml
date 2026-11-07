@@ -20,7 +20,6 @@ p2:
   critic_lr: 6e-5
   lora_rank: 64
   lora_alpha: 128
-  lora_dropout: 0.05
   # 奖励折扣 gamma。
   gamma: 1.0
   # GAE lambda。
@@ -73,7 +72,6 @@ actor_rollout_ref:
     use_fused_kernels: false
     lora_rank: "${p2.lora_rank}"
     lora_alpha: "${p2.lora_alpha}"
-    lora_dropout: "${p2.lora_dropout}"
     # 按用户选择覆盖全模型适用线性层，包含视觉塔/连接器；输出头由 PEFT 排除。
     target_modules: "all-linear"
   actor:
@@ -84,6 +82,8 @@ actor_rollout_ref:
     use_torch_compile: false
     clip_ratio_low: "${p2.clip_ratio_low}"
     clip_ratio_high: "${p2.clip_ratio_high}"
+    # 论文式(5)：先对每条回答的有效 token 取均值，再对样本取均值。
+    loss_agg_mode: "seq-mean-token-mean"
     optim:
       lr: "${p2.actor_lr}"
     entropy_coeff: 0.0
@@ -137,7 +137,6 @@ critic:
     use_remove_padding: false
     lora_rank: "${p2.lora_rank}"
     lora_alpha: "${p2.lora_alpha}"
-    lora_dropout: "${p2.lora_dropout}"
     target_modules: "all-linear"
   strategy: "fsdp2"
   ppo_mini_batch_size: "${p2.mini_batch_size}"
@@ -145,6 +144,8 @@ critic:
   ppo_infer_micro_batch_size_per_gpu: 1
   forward_micro_batch_size_per_gpu: 1
   ppo_epochs: "${p2.ppo_epochs}"
+  # 与 Actor 使用相同的样本等权聚合；价值裁剪仍沿用原生 PPO 默认值。
+  loss_agg_mode: "seq-mean-token-mean"
   optim:
     lr: "${p2.critic_lr}"
   fsdp:
@@ -174,7 +175,7 @@ transfer_queue:
       total_storage_size: "${p2.queue_capacity}"
 trainer:
   n_gpus_per_node: "${p2.training_gpu_count}"
-  logger: ["console"]
+  logger: ["console", "tensorboard"]
   project_name: "CUDA-Agent-P2"
   experiment_name: "${p2.run_name}"
   # 宽松循环上限

@@ -84,17 +84,13 @@ def read_tasks(source, expected_split="train"):
 
 
 def load_manifest(path):
-    """输入清单路径；返回清单，核对历史转换文件或当前轻量清单的身份。"""
+    """输入轻量运行清单路径；返回已核对输入模式和身份的清单。"""
     path = Path(path)
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("input_mode") == "runtime":
-        if manifest["data_id"] != digest(manifest["identity"]):
-            raise ValueError(f"运行输入清单身份不匹配：{path}")
-    else:
-        # 兼容已有训练记录；新运行不再生成完整转换文件。
-        for name, expected in manifest["files"].items():
-            if file_digest(path.parent / name) != expected:
-                raise ValueError(f"训练输入被修改：{path.parent / name}")
+    if manifest.get("input_mode") != "runtime":
+        raise ValueError(f"仅支持原始 JSONL 的运行时适配清单，请使用新 run：{path}")
+    if manifest["data_id"] != digest(manifest["identity"]):
+        raise ValueError(f"运行输入清单身份不匹配：{path}")
     return manifest
 
 
@@ -133,7 +129,7 @@ def check_tasks(tasks, config, template):
 
 
 def prepare(config, run, limit=None, task_ids=None, dry_run=False):
-    """输入配置、run、选题和只读标记；返回 (框架输入路径对, 轻量/历史清单)。
+    """输入配置、run、选题和只读标记；返回 (框架输入路径对, 轻量运行清单)。
 
     新运行直接使用配置中的 train.jsonl/test.jsonl，不从 train 抽监控题。
     两侧只保存记录索引和摘要，完整题目及 prompt 不复制到运行目录。
@@ -142,28 +138,12 @@ def prepare(config, run, limit=None, task_ids=None, dry_run=False):
     run = Path(run).resolve()
     saved = config.get("data_manifest")
     path = ROOT / saved if saved else run / "data-manifest.json"
-    legacy = run / "data/manifest.json"
-    if not saved and legacy.is_file():
-        path = legacy
     manifest = load_manifest(path) if path.exists() else None
     if saved and manifest is None:
         raise FileNotFoundError(f"冻结的数据清单缺失：{path}")
     if manifest is not None and config.get("data_manifest_hash"):
         if digest(manifest) != config["data_manifest_hash"]:
             raise ValueError("运行输入清单被修改，不能继续使用原检查点")
-
-    if manifest is not None and manifest.get("input_mode") != "runtime":
-        if not saved and manifest["config_hash"] != digest(config):
-            raise ValueError("历史运行配置不匹配，拒绝混用")
-        if task_ids is not None and set(task_ids) != set(manifest["task_ids"]):
-            raise ValueError("不能改动历史运行题单")
-        if limit is not None and limit != len(manifest["task_ids"]):
-            raise ValueError("不能改动历史运行题数")
-        suffix = "jsonl" if "train.jsonl" in manifest["files"] else "parquet"
-        print("复用历史运行的冻结输入，不转换或覆盖原文件", flush=True)
-        return (
-            path.parent / f"train.{suffix}", path.parent / f"checkpoint-eval.{suffix}",
-        ), manifest
 
     source = (ROOT / config["data_sources"]["train"]).resolve()
     val_source = (ROOT / config["data_sources"]["val"]).resolve()

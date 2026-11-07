@@ -18,9 +18,8 @@ from .common import ROOT, digest, for_mode, now, read_config, write_json
 from .data import prepare
 
 
-def compose_config(project, run, data_paths, steps=None, resume=False, config_path=None,
-                   runtime_input=False):
-    """输入配置、run、输入路径、停止步数及适配方式；返回组合后的 DictConfig。
+def compose_config(project, run, data_paths, steps=None, resume=False, config_path=None):
+    """输入配置、run、原始 JSONL 路径和停止步数；返回组合后的 DictConfig。
 
     PPO/GAE、FSDP、优化器、权重同步及断点续跑均由 verl 原生训练器负责。
     此函数仅填充本次运行路径和配置插值，不实现训练算法。
@@ -48,13 +47,12 @@ def compose_config(project, run, data_paths, steps=None, resume=False, config_pa
         base, OmegaConf.load(source), {"p2": runtime},
         {"data": {"train_files": [str(data_paths[0])], "val_files": [str(data_paths[1])]}},
     )
-    if runtime_input:
-        # 使用 verl 公共 Dataset 扩展；这里注入的是派生路径，不增加第二份配置。
-        config.data.custom_cls = {
-            "path": str(ROOT / "src/p2/dataset.py"), "name": "CudaDataset",
-        }
-        config.data.p2_input_manifest = str(ROOT / project["data_manifest"])
-        config.data.p2_input_manifest_hash = project["data_manifest_hash"]
+    # 当前入口始终读取原始 JSONL，统一使用官方公共 Dataset 扩展。
+    config.data.custom_cls = {
+        "path": str(ROOT / "src/p2/dataset.py"), "name": "CudaDataset",
+    }
+    config.data.p2_input_manifest = str(ROOT / project["data_manifest"])
+    config.data.p2_input_manifest_hash = project["data_manifest_hash"]
     if project["wire"]:
         # --wire 只验证接线，不在第一步前执行整个 test 集的正式验证。
         config.trainer.val_before_train = False
@@ -85,12 +83,10 @@ def main():
     frozen = run / "config.json"
     if frozen.exists():
         saved = json.loads(frozen.read_text(encoding="utf-8"))
-        if "data_manifest" in saved:
-            project["data_manifest"] = saved["data_manifest"]
-            if "data_manifest_hash" in saved:
-                project["data_manifest_hash"] = saved["data_manifest_hash"]
-        elif not (run / "data/manifest.json").is_file():
-            raise FileNotFoundError("历史运行缺少冻结的数据清单，不能自动替换续跑输入")
+        if "data_manifest" not in saved or "data_manifest_hash" not in saved:
+            raise ValueError("仅支持原始 JSONL 轻量清单的续跑，请使用新 run")
+        project["data_manifest"] = saved["data_manifest"]
+        project["data_manifest_hash"] = saved["data_manifest_hash"]
         if digest(saved) != digest(project):
             raise ValueError("run 已冻结为不同训练配置；更改训练参数请使用新 run")
     checkpoint = run / "checkpoints/latest_checkpointed_iteration.txt"
@@ -103,22 +99,21 @@ def main():
         CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_AGENT_P2_RUN=str(run),
         TZ="Asia/Shanghai", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
         RAY_ADDRESS="local",
+        # verl 原生 TensorBoard 后端读取此目录；每个 run 独立，续跑沿用同一路径。
+        TENSORBOARD_DIR=str(run / "tensorboard"),
     )
     # 只检查原始记录并冻结索引；完整 prompt/奖励字段由 Dataset 在读取时补充。
     data_paths, manifest = prepare(project, run, args.limit, args.task_id, args.dry_run)
-    task_count = manifest["task_count"] if "task_count" in manifest else len(manifest["task_ids"])
+    task_count = manifest["task_count"]
     if task_count < project["batch_size"]:
         raise ValueError(f"可用记录 {task_count} 少于 batch_size={project['batch_size']}")
-    runtime_input = manifest.get("input_mode") == "runtime"
-    if runtime_input:
-        if manifest["val_task_count"] <= 0:
-            raise ValueError("test 中没有通过轻量检查的验证记录")
-        project["data_manifest"] = (run / "data-manifest.json").relative_to(ROOT).as_posix()
-        project["data_manifest_hash"] = digest(manifest)
+    if manifest["val_task_count"] <= 0:
+        raise ValueError("test 中没有通过轻量检查的验证记录")
+    project["data_manifest"] = (run / "data-manifest.json").relative_to(ROOT).as_posix()
+    project["data_manifest_hash"] = digest(manifest)
     from omegaconf import OmegaConf
     config = compose_config(
         project, run, data_paths, args.steps, args.resume, args.config,
-        runtime_input=runtime_input,
     )
     if (
         list(config.data.train_files) != [str(data_paths[0])]

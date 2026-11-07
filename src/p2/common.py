@@ -25,19 +25,6 @@ def read_config(path):
     config = OmegaConf.to_container(document.p2, resolve=False)
     # 原生 verl 字段也参与身份校验，避免只改 YAML 下半部分就悄悄混用训练协议。
     raw = OmegaConf.to_container(document, resolve=False)
-    # 同一个 cuda_single 类由 YAML 注册改为 Python 注册，训练语义没有变化。
-    # 摘要保留原有等价表示，使已有数据/检查点可继续使用；此路径仅用于
-    # 身份归一化，不会打开文件。其他原生参数仍全部参与摘要与严格校验。
-    agent = raw.get("actor_rollout_ref", {}).get("rollout", {}).get("agent", {})
-    if agent.get("default_agent_loop") == "cuda_single" and not agent.get("agent_loop_config_path"):
-        agent["agent_loop_config_path"] = "${p2.root}/configs/p2-agent-loop.yaml"
-    # 数据文件的位置/容器格式由运行时清单绑定；它们不改变 PPO 超参数。
-    # 将标准输入路径归一化为历史表示，使旧 Parquet run 可以只读续用原输入。
-    data = raw.get("data", {})
-    if data.get("train_files") == ["${p2.train_file}"]:
-        data["train_files"] = ["${p2.run}/data/train.parquet"]
-    if data.get("val_files") == ["${p2.checkpoint_eval_file}"]:
-        data["val_files"] = ["${p2.run}/data/checkpoint-eval.parquet"]
     config["verl_overrides_hash"] = digest({key: value for key, value in raw.items() if key != "p2"})
     # 题目来源直接使用 verl 原生 data 配置；本项目每侧只读取一份原始 JSONL。
     config["data_sources"] = {}
@@ -63,8 +50,6 @@ def read_config(path):
         raise ValueError("batch_size 必须能被 mini_batch_size 整除")
     if config["mini_batch_size"] % len(train):
         raise ValueError("mini_batch_size 必须能被训练卡数整除")
-    if not 0 <= config["lora_dropout"] < 1:
-        raise ValueError("lora_dropout 必须位于 [0, 1)")
     return config
 
 

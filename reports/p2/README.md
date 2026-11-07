@@ -6,7 +6,8 @@
 
 Actor/Critic 的模型加载均继承 verl 原生实现。Critic 经 load_valuehead_model 和
 Transformers 的 AutoModelForTokenClassification 自动创建价值头，项目不再单独实现
-Qwen Critic 加载函数。模型扩展只保留 LoRA 角色/dropout 配置、文本输入接线及更新审计。
+Qwen Critic 加载函数。Actor 的 LoRA 构造使用 verl 原生实现；模型扩展只保留 Critic 的 LoRA 角色适配和文本输入接线。
+更新和标量指标全部使用 verl 原生实现。
 
 2026-11-06 已在 `runs/p2/wiring-20261105` 完成两步 8K 接线，含从第一步检查点恢复、
 Actor/Critic 更新和策略版本 0→1 的新采样。独立 CUDA 奖励重放也已通过。
@@ -21,7 +22,7 @@ Actor/Critic 更新和策略版本 0→1 的新采样。独立 CUDA 奖励重放
 不生成转换后的训练/验证数据副本。清单冻结原始行及顺序、输入摘要和检查结果，
 `config.json` 绑定清单路径及摘要，续跑时校验后复用原题单。
 准备阶段不执行原题、不启动 Docker/GPU；实际 CUDA 检查与测时仍在奖励阶段执行。
-历史已完成 run 保留原 Parquet 及检查点。本轮改变 LoRA 结构和验证协议，需使用新 run，
+历史已完成 run 的文件保留不动；当前入口不再续用历史转换数据格式。本轮改变 LoRA 结构和验证协议，需使用新 run，
 不能将旧的语言层 LoRA 检查点直接当作全模型 LoRA 续训。
 主配置仅保留 `configs/p2-single-ppo-warmup.yaml`，生成流程由 Python 注册。
 
@@ -42,9 +43,28 @@ bash scripts/p2-train.sh --run runs/p2/my-wire --wire --steps 2 --resume
 上述两题由示例的 `--task-id` 显式选定；`--wire` 仅把每步 batch 改为 2，
 不会把数据集固定为两题。新运行不传 `--task-id/--limit` 时，从全部 train 开始轻量检查。
 
-当前 Actor/Critic 使用 `flash_attention_2`、`target_modules: all-linear` 和
-`lora_dropout: 0.05`。PEFT 覆盖语言与视觉的适用线性层，Critic score 头另外完整训练并保存。
+当前 Actor/Critic 使用 `flash_attention_2`、`target_modules: all-linear`，
+LoRA dropout 沿用 PEFT 默认值 0，不提供额外配置或自定义 dropout 接线。PEFT 覆盖语言与视觉的适用线性层，Critic score 头另外完整训练并保存。
 vLLM 使用原生 `enable_tower_connector_lora` 加载视觉适配器；任务仍只有文本，
 视觉层不会因挂上 LoRA 就获得有效视觉训练。正式训练按频率分批遍历全部 test，
 `--wire` 仅做接线，关闭训练前验证及周期性全量验证。test 已用作训练期间验证，
 其指标应标为验证成绩；当前没有另外保留一份未使用的最终测试集。
+
+当前损失使用 `seq-mean-token-mean`，Actor 的额外 dual-clip 设置为不生效。
+训练默认启用 verl 原生 TensorBoard 日志，保存在每个 run 的 `tensorboard/`。
+在服务器执行以下命令，然后在 VS Code 转发 6006 端口查看实时曲线：
+
+```bash
+.runtime/conda/learner/bin/tensorboard --logdir runs/p2 --host 127.0.0.1 --port 6006
+```
+
+实际 PPO loss、梯度范数、学习率、奖励和验证标量来自 verl；不再生成逐 rank 权重变化审计。
+本轮改动改变损失及配置身份，应使用新 run；未启动训练验证。
+
+新运行不再生成 `rollouts/*.json` token/logprob 审计副本。每条回答保存在
+`samples/<ID>/response.txt`，对应 `result.json` 保存奖励、正确性及反馈/隐藏评测路径。
+路径相对于本次 run 根目录。确认源码已完整保存在评测快照后，删除重复的 workspace；
+尚无完整快照或发生环境异常时保留现场。P2 评测总结果只保存摘要和 detail_paths，
+阶段详情及候选源码继续保存在 kernel/evaluations 下。
+参考预检仅落盘采样摘要；worker 日志不再重复打印整份结果 JSON。
+检查点保留数量未调整；旧运行文件不迁移、不删除。完整说明见报告第 14 节。

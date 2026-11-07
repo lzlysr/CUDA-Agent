@@ -25,7 +25,7 @@ Actor→vLLM 权重同步和检查点均使用 verl 原生实现，不重新实�
 | `src/p2/dataset.py`                 | verl 公共 Dataset 扩展；从原始 train 读取记录，取样时补充 prompt/奖励字段    |
 | `src/p2/train.py`                   | 加载官方配置与 YAML 覆盖、选择 GPU、调用 `run_ppo(..., TaskRunnerV1)`      |
 | `src/p2/reward.py`                  | 严格解析最终源码，调用 P1 沙箱并产生有效终局奖励                             |
-| `src/p2/models.py`                  | 继承原生模型/价值头加载，仅补齐 LoRA 角色/dropout、文本接线与更新审计       |
+| `src/p2/models.py`                  | 继承原生模型/价值头加载，仅补齐 Critic LoRA 角色与文本接线；Actor LoRA、优化器与指标使用原生实现       |
 | `src/p2/rollout.py`                 | 用公开 register 注册单轮生成流程：固定 seed，限制总长，保留真实 token        |
 | `src/p2/sampler.py`                 | 公开 custom_sampler 扩展：后台环境异常立即终止批次，拒绝伪造零奖励           |
 
@@ -94,7 +94,7 @@ Hugging Face train_test_split。本轮按用户最新要求直接使用已有两
 | Batch / minibatch / 每卡 microbatch | 24 / 12 / 1                          | 针对本机资源的本地选择，不冒充论文原始规模           |
 | PPO epochs                          | 1                                    | 一批新采样执行一次 PPO epoch                         |
 | Actor / Critic LR                   | 3e-5 / 6e-5                          | 本地参数；论文为 3e-6 / 6e-6，本轮未调整学习率 |
-| LoRA rank / alpha / dropout         | 64 / 128 / 0.05                      | all-linear 包含语言与视觉适用线性层；score 头另外完整训练 |
+| LoRA rank / alpha                   | 64 / 128                             | all-linear 包含语言与视觉适用线性层；score 头另外完整训练 |
 | Critic                              | 同源骨干 + hidden_size→1 score      | 独立 LoRA；score 完整训练，不产生词表 logits         |
 | γ / λ                             | 1 / 0.95                             | 使用 GAE，非 GRPO                                    |
 | Ratio clip                          | [0.8, 1.28]                          | 下限 1−0.2，上限 1+0.28                             |
@@ -103,7 +103,7 @@ Hugging Face train_test_split。本轮按用户最新要求直接使用已有两
 | 训练正确性检查                      | 五组反馈输入                         | 用户已确认                                           |
 | 隐藏验收                            | test 检查点验证                      | 不向训练奖励暴露隐藏检查                             |
 | 测时                                | 后测基线、1×10                      | 以本项目最新约定为准                                 |
-| 保存/检查点评估                     | 每 10 步，最多保留两份检查点         | 检查点按框架保存完整训练状态                         |
+| 保存/检查点评估                     | 每 30 步，保留数量不设上限           | 按当前 YAML；检查点保存完整训练状态，注意磁盘容量 |
 
 短测 `--wire` 覆盖为总上下文 8192、batch/minibatch=2、最多两步、每步保存，
 关闭训练前和周期性全量验证。它只验证接线，不代表 32K 容量、稳定训练或能力提升。
@@ -120,7 +120,7 @@ Actor/Critic 均继承 verl 的 `_build_module`。Critic 由原生 `load_valuehe
 调用 Transformers 的 `AutoModelForTokenClassification`，自动选择
 `Qwen3_5ForTokenClassification` 并创建 score 头；项目不再单独覆盖 Critic 加载流程。
 默认 verl 的 CAUSAL_LM LoRA 包装不适合这个模型类，且未传入 dropout，项目只在
-LoRA 构造处补齐 TOKEN_CLS、lora_dropout 和 modules_to_save=[score]；适配器仍由
+Critic LoRA 构造处补齐 TOKEN_CLS 和 modules_to_save=[score]；Actor 使用原生构造。适配器仍由
 PEFT 创建。目标层、排除层和 target_parameters 均按原生模型配置透传。
 使用 PEFT 的 autocast_adapter_dtype=false 沿用基础层 dtype，删除手动 BF16 转换循环。
 `CudaHFModelConfig` 是标准模型配置的薄扩展：Ray 反序列化时导入项目模块，保证
@@ -148,10 +148,10 @@ Ray 的 Unix socket 有 107 字节路径上限，专属临时目录放在
 - data/processed/train.jsonl、test.jsonl：原始训练/验证来源；不创建完整转换副本。
 - run 的 data-manifest.json：分别保存 train/val 的原始行、输入摘要、token 长度和拒绝原因。
 - run 的 `config.json`：冻结项目参数、清单路径及摘要；`verl-resolved.yaml`：实际框架配置。
-- `rollouts/`：真实 token、mask、采样 logprob 和策略版本的轻量审计；训练不重读它。
-- `samples/`：本次最终 response、候选工作区、奖励结果或环境错误证据。
+- 当前不再生成 `rollouts/`：PPO 使用 TransferQueue 中的真实 token/mask/logprob，不保存重复数组副本。
+- `samples/`：原始 response、奖励及评测路径索引；完整快照形成后清理工作区，异常现场保留。
 - `kernel/`：现有 Evaluator 的冻结候选、编译/正确性/测时记录。
-- `audit/`：各 rank 的可训练参数及梯度/权重变化，含价值头变化记录。
+- `tensorboard/`：verl 原生逐步标量，供 TensorBoard 查看；当前不再生成自定义更新审计。
 - `checkpoints/global_step_*`：原生 Actor/Critic、优化器、调度器、RNG 和 dataloader 状态。
 - `status.json`：本次启动完成/失败标记；不把配置组合成功记为训练成功。
 
@@ -385,9 +385,9 @@ meta/CPU 初始化、模型 dtype、梯度检查点和 Qwen 前向适配也随�
   LoRA 创建、冻结和筛选均调用 PEFT；target_modules、target_parameters、exclude_modules
   按原生字段透传，不再额外强制某一组 GDN、视觉或输出层名称。
 - `autocast_adapter_dtype=false`：使用 PEFT 原生选项维持基础层 dtype，删除手动遍历参数
-  转回 BF16 的循环。参数及优化器变化审计继续包装原生更新函数。
+  转回 BF16 的循环。优化器更新在本次精简后直接继承原生实现，旧审计记录仅作历史证据。
 - Dataset、单轮 rollout 和严格失败检查继续使用 verl 公开扩展接口；它们负责项目数据、
-  固定生成 seed/总上下文和有效奖励约束，没有复制 PPO/GAE/FSDP 或优化器实现。
+  固定生成 seed、输出核对和有效奖励约束；总上下文由原生服务控制，没有复制 PPO/GAE/FSDP 或优化器实现。
 
 当前 YAML 的 freeze_vision_tower 已由用户设为 true，但固定版本 V1/FSDP2 路径没有消费
 该字段，它不构成视觉 LoRA 冻结/排除。实际覆盖范围由两侧 model 的 target_modules 和
@@ -411,3 +411,111 @@ exclude_modules 决定；本轮只补齐原生排除参数的透传，没有替�
 及 `audit/`。本次使用同架构小模型做组件接线核对，没有启动 Ray、整组 PPO、正式数据
 验证或 32K 训练，也没有运行 CPU 回归套件。小模型没有经过 FSDP 包装；这次结果不替代
 多卡 PPO、FSDP 检查点恢复或训练效果评估。
+
+
+## 12. 2026-11-07：损失聚合和原生接口精简
+
+本节记录 2026-11-07 的接口精简；dropout 的最新处理见第 13 节。
+第 7、9、10、11 节的实测记录保留其历史配置与验证边界。
+
+- Actor/Critic 显式设置 `loss_agg_mode: seq-mean-token-mean`。Actor 对每条回答的
+  有效 token 取平均，再对样本取平均，对应论文式(5)的轨迹等权聚合。
+- 原生 vanilla PPO 会将 log-ratio 限制在 [-20,20]，ratio 至多 exp(20)。
+  配置 `clip_ratio_c=1e10` 高于此值，使额外 dual-clip 不生效，保留 [0.8,1.28]
+  的普通 PPO 裁剪。使用有限数避免零优势乘无穷大。未另写 PPO loss、未改 verl。
+  原生数值稳定保护、GAE 优势标准化和 Critic 价值裁剪仍保留，不将其宣称为论文披露参数。
+- 当前 FSDP2 原生调度默认为 constant，warmup 比例为 0；论文未披露 cosine 调度。
+  本次不改学习率或调度类型。
+- `CudaSingleTurnLoop` 继承原生 `SingleTurnAgentLoop`。提示词处理、生成请求、
+  Continuous Token 合并和原生耗时指标由父类执行；项目只固定 seed 并核对输出，不再额外落盘采样数组。
+  总上下文由原生 vLLM 服务依据 max_model_len 截断可生成 token 预算。
+- 删除模型扩展的 record/optimizer_step 审计，优化器更新完全继承 verl。
+  非有限梯度恢复原生的告警并跳过更新语义，不再由项目额外抛出审计异常。
+  Critic 的 LoRA 角色接线保留：需 TOKEN_CLS/可保存 score；dropout 接线已按第 13 节移除。
+- 删除旧 Parquet、完整转换 JSONL 和旧 agent-loop YAML 的身份归一化/续跑分支。
+  当前只支持原始 train/test JSONL + 轻量 data-manifest；不迁移或删除历史结果。
+  损失和配置身份已变化，应建立新 run，不能用这次设置直接续跑旧实验。
+- trainer.logger 启用 console/tensorboard，入口把 TENSORBOARD_DIR 设为 run/tensorboard。
+  无需自写曲线记录器；已有 learner 中已安装 TensorBoard。手动启动展示服务：
+
+```bash
+.runtime/conda/learner/bin/tensorboard --logdir runs/p2 --host 127.0.0.1 --port 6006
+```
+
+通过 VS Code 转发服务器 6006 端口，在浏览器查看奖励、Actor/Critic loss、梯度范数、
+学习率、回答长度、耗时及原生验证标量。逐步指标在训练更新或验证完成后写入，
+不是每个生成 token 刷新一次；TensorBoard 原生写盘有短暂缓冲。
+
+关于基线顺序：论文正文未明确写出 PPO 奖励服务的基线执行先后；官方公开的
+agent_workdir/utils/profiling.py 的 main 确实先测 CUDA 候选，再测 eager、compile。
+本项目按该公开示例及已确认协议使用后测基线，不能把公开示例推断写成未公开训练服务的事实。
+
+训练中每个检查点已经会重新生成验证回答，不必等训练结束才检查正确率和奖励。
+当前 RewardManager 传递 score/acc 等原生验证标量；Faster Rate 和正确样本加速比几何均值
+尚未聚合成完整论文表格，逐候选 speedup 仍在详细结果中。P2 warm-up 的前后对比应使用
+同一套单轮提示词、生成预算、采样设置和评测协议；基础模型与训练后 Actor 使用相同设置。
+P1 single 的指令内容接近，但须先核对预算与采样设置；P1 agent 有工具交互，属于另一评测协议。
+论文主表及 w/o Agent Loop 消融均在 agent loop 下评测，复现主表时应另做同协议的 agent 评估。
+
+本次未启动 PPO、GPU 实验或 CPU 回归套件；仅做语法、配置及原生调用关系的静态核对。
+
+
+## 13. 2026-11-07：取消额外的 LoRA dropout 适配
+
+按用户最新决定，删除主配置的 lora_dropout、Actor/Critic 模型覆盖项、
+CudaHFModelConfig 额外字段及公共配置校验，不再为 dropout 增加本地代码。
+PEFT 支持该参数，但当前 verl 的原生构造没有传入它；不传时采用默认值 0。
+历史 dropout=0.05 的组件测试记录保留为当时配置，不代表当前配置再次实测。
+
+Actor 不再注册项目自定义引擎，直接使用 verl 的 FSDPEngineWithLMHead 及其 LoRA 构造。
+Critic 保留最小的 _build_lora_module：使用 PEFT TOKEN_CLS 包装、modules_to_save=[score]，
+使原生价值头可训练并保存。该适配与 dropout 无关；未手写价值头或优化器。
+不再需要 Actor/Critic 共用的 CudaLoraMixin，也不保留 CudaActorEngine。
+模型配置扩展仍负责 Ray 导入注册和纯文本 position_ids 接线。
+
+其余 LoRA rank/alpha、target_modules、PPO 参数及数据协议保持现有配置。
+本次未运行训练、GPU 实验或 CPU 回归套件；仅核对语法、配置与原生调用关系。
+配置身份发生变化，后续使用新 run；不改写历史检查点或实验结果。
+
+
+## 14. 2026-11-07：精简 P2 输出，保留训练和评分证据
+
+仅调整后续运行的生成逻辑，不迁移、不删除 runs/p2 下的历史实验文件。
+检查点保留数量仍使用当前配置，本轮不调整。
+
+### 14.1 必要输出与关系
+
+- config.json、data-manifest.json、verl-resolved.yaml：保留配置冻结、数据身份和完整启动配置。
+- status.json、tensorboard/：保留运行状态与原生训练/验证曲线。
+- 不再写 rollouts/*.json。PPO 仍使用原生返回并由 TransferQueue 管理的真实 token、mask、
+  logprob；只是取消磁盘审计副本，不影响本批更新或原生检查点恢复。
+- samples/<sample_id>/response.txt：保留原始回答，不修补 JSON，不删改模型推理文本。
+- samples/<sample_id>/result.json：保留奖励/正确性/加速比、sample_id/task_id、hidden，
+  并增加 response_path、feedback_result_path、acceptance_result_path。
+  没有对应阶段时路径为 null；所有路径均相对于本次 run 根目录。
+- kernel/evaluations/<编号>/candidate/：保留可信源码快照与 source_hashes。
+- kernel/evaluations/<编号>/result.json：保留正确性、奖励、speedup、checks、身份及状态；
+  compilation、execution、timing、baseline_after 等有独立详情文件时改为 detail_paths 引用。
+  candidate_path 同样相对于本次 P2 run。没有独立文件的诊断继续留在总结果中。
+- 阶段目录的 result.json / bench_result.json 和 worker.log 继续保留。
+- scheduler/ 锁文件、worker-config.json 和完整检查点保留其原有职责。
+
+P2 奖励先用完整内存评测结果计算，之后才精简磁盘总结果。返回给 verl 的评分不变。
+精简函数仅由 P2 调用，不改变 P1 独立运行的总结果格式；P2 读详情时沿 detail_paths 查找。
+
+### 14.2 工作区和预检审计清理
+
+反馈与必要的隐藏验收结束、样本结果写入后，逐文件确认 workspace 源码与可信快照一致，
+才删除重复 workspace。不存在完整快照、含链接、内容不一致或环境异常时保留现场。
+普通文件清理失败记录 workspace_cleanup_error，不把已有效计算的模型奖励改成负分。
+既有 input-spec/compile-cache 完成后清理逻辑保持不变。
+
+worker.prepare 仍使用原有完整采样进行确定性/近常数判定；判定结束后才把持久化采样
+转换为数量、最小/最大值、SHA256 等摘要，保留 shape/dtype/numel 及判定结论。
+worker 日志仅输出阶段、状态、结果文件位置、耗时及错误/traceback，不再重复整份结果 JSON。
+此 worker 是 P1/P2 共用入口，因此两者后续预检审计和终端日志均使用精简形式；
+验算次数、容差、种子、测速与奖励协议均未改动。
+
+当前仍保存完整 Actor/Critic 模型、优化器、调度器/RNG 和数据游标。没有启用可能漏存
+Critic score 头的 LoRA-only 裁剪，也没有改动 max_checkpoints。
+本轮不启动 PPO/GPU 实验，不运行 CPU 回归套件；仅做语法、引用和持久化路径的静态核对。

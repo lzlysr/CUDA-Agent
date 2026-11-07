@@ -8,6 +8,8 @@
 # bash scripts/p2-train.sh --run runs/p2/single-ppo-warmup --dry-run
 # 输入：已有 train.jsonl 和配置；输出：run 下的轻量清单、运行记录及检查点。
 # --prepare-only 仅检查并保存清单；--dry-run 只读预览；--resume 恢复训练。
+# 在服务器执行以下命令，然后在 VS Code 转发 6006 端口查看实时曲线：
+# .runtime/conda/learner/bin/tensorboard --logdir runs/p2 --host 127.0.0.1 --port 6006
 
 set -euo pipefail
 P2_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
