@@ -824,3 +824,32 @@ GPU 0 空闲显存不足，因此四题在已授权 GPU 7 上串行生成；不�
 证据：`.runtime/tmp/file-block-tolerant-generation-20261107/`，包含每题原始
 response.txt、messages.json、summary.json、通过时的 candidate/，以及隔离
 生成脚本和 GPU 7 日志。四条生成均已完成。
+
+## 17. 参考自检容差与底层错误记录（2026-11-08）
+
+single-ppo-warmup 在训练前验证时，原始参考题 ops6k-f05dde20a8f3f503 的连续两次
+输出出现最大约 3.58e-7 的绝对差异，旧 worker 的 atol=rtol=0 自检将其拒绝。
+参考失败后奖励无法定义，保护采样器终止本次运行；这不是模型标签解析或 PPO
+参数更新失败。该次验证只落盘六条有效 -1 和一条参考异常，没有开始 PPO 更新。
+
+现在参考浮点/复数重复输出检查读取同一份 kernel 配置中的 atol/rtol（当前均为
+0.01）；整数、布尔、普通标量、类型/shape/dtype/结构及非有限值的检查继续保留。
+参考模型仍运行两次，明显超出配置容差时仍拒绝，不伪造候选奖励。
+
+准备阶段只做语法、接口、长度等轻量检查，不能证明参考 GPU 执行一定成功。
+P2 奖励阶段若参考预检失败，异常明确给出 task_id、preflight 状态、底层失败类型、
+原因及详情绝对路径；samples/<样本>/infrastructure-error.json 另外保存结构化
+reference_failure，包含 preflight_status、failure_kind、error_type、error、
+detail_path。detail_path 相对于本次 run；原阶段结果继续保留完整 traceback。
+
+当前失败保护策略保留：实际抽到并走到 GPU 参考检查的 train 或 val 题，若其参考
+无法评分，会停止当前 run；没有遍历执行的题不会触发。候选格式、编译或数值
+失败仍是正常有效 -1。初始验证最多 24 条，不代表准备时执行了整个 test。
+
+本次在 GPU 4 独立验证：原出错参考 ops6k-f05dde20a8f3f503 的 reference_prepare
+通过，近常数标记为 false，控制器耗时约 4.92 秒，使用原配置 atol=rtol=0.01。
+另经正式 P2 evaluate_response 入口验证微型负向参考：两次输出相差约 100，仍然
+抛出参考异常；sample 的 infrastructure-error.json 保留了 reference_nondeterministic、
+ReferenceValidationError、具体差异、实际容差及可访问的详情路径。两项均在
+`.runtime/tmp/reference-tolerance-20261108/` 独立目录执行，不回写旧 run。
+未运行参考测时、候选 CUDA 评测、模型 rollout、PPO 或 CPU 回归套件。

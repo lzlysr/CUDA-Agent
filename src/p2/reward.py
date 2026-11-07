@@ -97,6 +97,7 @@ def evaluate_response(config, response, task, hidden=False):
     pool = EvaluationPool(cfg["evaluation_gpu"], run / "scheduler", cfg=cfg)
     evaluator = ParallelEvaluator(cfg, evaluator_run, pool)
     evaluation = acceptance = None
+    reference_failure = None
     try:
         try:
             files = parse_single(response)
@@ -114,7 +115,28 @@ def evaluate_response(config, response, task, hidden=False):
                 try:
                     preflight = evaluator.prepare(task)
                     if preflight["status"] != "ok":
-                        raise InfrastructureError("已通过准备阶段的参考任务本次无法评分")
+                        # 准备阶段只有轻量检查；GPU 参考失败时保留实际失败阶段及原始原因。
+                        detail_relative = preflight.get("bench_result_path") or preflight["prepare_result_path"]
+                        detail_path = evaluator_run / detail_relative
+                        detail = json.loads(detail_path.read_text(encoding="utf-8"))
+                        reference_failure = {
+                            "preflight_status": preflight["status"],
+                            "failure_kind": detail.get("failure_kind", "reference_invalid"),
+                            "error_type": detail.get("error_type"),
+                            "error": detail.get("error") or (
+                                "reference output rejected as near-constant"
+                                if detail.get("near_constant_sampled_output")
+                                else f"reference stage returned {detail.get('status')}"
+                            ),
+                            "detail_path": detail_path.relative_to(run).as_posix(),
+                        }
+                        raise InfrastructureError(
+                            f"参考预检失败：task_id={task['task_id']}; "
+                            f"status={preflight['status']}; "
+                            f"failure_kind={reference_failure['failure_kind']}; "
+                            f"{reference_failure['error_type']}: {reference_failure['error']}; "
+                            f"detail_path={detail_path}"
+                        )
                     evaluation = evaluator.evaluate(task, workspace)
                     acceptance = evaluator.evaluate(task, workspace, final=True) if hidden and evaluation.get("correct") else None
                     result = dict(training_reward(evaluation, acceptance), correct=bool(evaluation.get("correct")))
@@ -146,9 +168,13 @@ def evaluate_response(config, response, task, hidden=False):
         return {"score": result["reward"], "acc": int(result.get("correct", False)),
                 "reward_valid": True, "hidden": hidden, "detail": str(request / "result.json")}
     except Exception as error:
-        write_json(request / "infrastructure-error.json", {
+        failure = {
             "at": now().isoformat(), "error_type": type(error).__name__, "error": str(error), "task_id": task["task_id"],
-        })
+        }
+        # 原阶段文件保留完整 traceback；样本索引保存底层分类、原因及相对 run 的详情路径。
+        if reference_failure is not None:
+            failure["reference_failure"] = reference_failure
+        write_json(request / "infrastructure-error.json", failure)
         raise
 
 

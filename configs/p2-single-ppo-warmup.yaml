@@ -4,7 +4,7 @@ p2:
   seed: 42
   model: "models/Qwen3.5-9B"
   # 训练/rollout 物理卡号。
-  training_gpus: [0, 7]
+  training_gpus: [6, 7]
   # 复用已验通的 P1 评测协议。
   kernel_config: "configs/p1-pilot.json"
   # 评测卡和并发覆盖，正式计时仍独占。

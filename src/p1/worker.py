@@ -237,7 +237,7 @@ def load_model(mod, klass, init_seed, input_spec):
 # 参考准备入口：cfg 是配置字典，源码来自 /reference/model.py。
 # 输出文件写入 /outputs/input-spec；返回输出审计、近常数标记及案例数量等信息。
 def prepare(cfg):
-    """输入配置；核查参考确定性/有限值/近常数，写输入规格及参数，返回审计元数据。"""
+    """输入配置；核查参考容差内稳定性/有限值/近常数，写输入规格及参数，返回审计元数据。"""
     mod = load("/reference/model.py", "reference_task")
     metadata = []
     out = Path("/outputs")
@@ -269,27 +269,30 @@ def prepare(cfg):
 
             # x/y 是同一个参考模型两次执行的输出；递归比较，不匹配时抛出异常。
             def equal(x, y, path="output"):
-                """输入两次参考输出及节点路径；严格比较，失败保留路径/种子，返回 None。"""
+                """输入两次参考输出及节点路径；浮点按配置容差比较，失败保留路径/种子，返回 None。"""
                 context = f"{path}; init_seed={s}, input_seed={input_seed}"
                 if type(x) is not type(y):
                     raise ReferenceValidationError(
                         "reference_nondeterministic", f"Reference output type changed at {context}"
                     )
-                # 张量节点执行有限性检查和零容差数值比较。
+                # 张量节点先检查有限性，再按数据类型选择重复输出的比较容差。
                 if isinstance(x, torch.Tensor):
+                    floating = x.is_floating_point() or x.is_complex()
                     # 显式检查浮点输出中是否存在 NaN 或 Inf。
-                    if (x.is_floating_point() or x.is_complex()) and not torch.isfinite(x).all():
+                    if floating and not torch.isfinite(x).all():
                         raise ReferenceValidationError(
                             "reference_nonfinite", f"Reference has nonfinite output at {context}"
                         )
-                    # atol/rtol 都为 0，要求数值完全相等，且不接受 NaN 与 NaN 相等。
+                    # 浮点/复数读取同一份数值验算配置；整数和布尔张量仍要求完全相等。
+                    atol = cfg["atol"] if floating else 0
+                    rtol = cfg["rtol"] if floating else 0
                     try:
-                        torch.testing.assert_close(x, y, atol=0, rtol=0, equal_nan=False)
+                        torch.testing.assert_close(x, y, atol=atol, rtol=rtol, equal_nan=False)
                     except AssertionError as error:
                         raise ReferenceValidationError(
                             "reference_nondeterministic",
                             f"Reference repeated output differs at {context}; "
-                            f"dtype={x.dtype}, shape={tuple(x.shape)}\n{error}",
+                            f"dtype={x.dtype}, shape={tuple(x.shape)}, atol={atol}, rtol={rtol}\n{error}",
                         ) from error
                 # 列表或元组按对应位置递归检查。
                 elif isinstance(x, (list, tuple)):
