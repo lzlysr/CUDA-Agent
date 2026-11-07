@@ -28,7 +28,13 @@ from .helper.pilot_parallel import archive_partial_trajectory, gpu_roles
 from .helper.inference import concurrency
 from .helper.progress import PilotProgress
 from .helper.turn_log import TurnLog
-from .helper.tool_calls import answer_body, parse_calls, parse_single
+from .helper.tool_calls import (
+    SINGLE_FILE_DELIVERY,
+    SINGLE_FILE_DELIVERY_REMINDER,
+    answer_body,
+    parse_calls,
+    parse_single,
+)
 from .helper.workspace import workspace_path
 from .evaluation import Evaluator, InfrastructureError
 
@@ -268,18 +274,8 @@ class Pilot:
                 "The SKILL workflow is guidance only for this single mode: "
                 "there are no tools or execution feedback.\n"
             )
-            user = (
-                'Generate one complete solution with no execution feedback. Return only a JSON object '
-                '{"files":{"model_new.py":"...","kernels/kernel.cu":"...","kernels/kernel_binding.cpp":"..."}} '
-                'after your reasoning. All file contents must be complete. model_new.py must define '
-                'class ModelNew and import cuda_extension directly. Only model_new.py and source files '
-                'directly under kernels/ are writable; omit binding.cpp, binding_registry.h, model.py, '
-                'utils/, setup.py and other files. Escape source newlines inside JSON strings. '
-                'Do not replace the JSON object with Markdown Python/CUDA code blocks.\n'
-                "Deliver only the allowed candidate files; do not include auxiliary scripts/notebooks. "
-                "Invalid/incomplete JSON is a failed single attempt; no automatic repair or extra generation.\n"
-                + interface
-            )
+            # 原题之后再次强调一开一闭及停止位置，避免额外输出孤立结束标签。
+            user = SINGLE_FILE_DELIVERY + interface + SINGLE_FILE_DELIVERY_REMINDER
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user},

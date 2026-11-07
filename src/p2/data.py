@@ -22,6 +22,7 @@ def prompt_template():
     """
     # 复用 P1 的约束文本；P2 没有 shell 工具，也没有生成后的补写机会。
     from p1.run import CONTRACT
+    from p1.helper.tool_calls import SINGLE_FILE_DELIVERY
 
     official = ROOT / "upstream/CUDA-Agent/agent_workdir"
     system = (
@@ -34,26 +35,20 @@ def prompt_template():
         "The SKILL workflow is guidance only for this single mode: "
         "there are no tools or execution feedback.\n"
     )
-    user = (
-        'Generate one complete solution with no execution feedback. Return only a JSON object '
-        '{"files":{"model_new.py":"...","kernels/kernel.cu":"...","kernels/kernel_binding.cpp":"..."}} '
-        'after your reasoning. All file contents must be complete. model_new.py must define '
-        'class ModelNew and import cuda_extension directly. Only model_new.py and source files '
-        'directly under kernels/ are writable; omit binding.cpp, binding_registry.h, model.py, '
-        'utils/, setup.py and other files. Escape source newlines inside JSON strings. '
-        'Do not replace the JSON object with Markdown Python/CUDA code blocks.\n'
-        "Deliver only the allowed candidate files; do not include auxiliary scripts/notebooks. "
-        "Invalid/incomplete JSON is a failed single attempt; no automatic repair or extra generation.\n"
-    )
+    user = SINGLE_FILE_DELIVERY
     for name in ("binding.cpp", "binding_registry.h"):
         user += f"\nFixed {name}:\n```cpp\n{(official / name).read_text()}\n```\n"
     return system, user
 
 
 def make_prompt(task, template=None):
-    """输入原题和可复用的公共文本；返回与原 P2 相同的 system/user 消息。"""
+    """输入原题和公共文本；返回 system/user 消息，在原题末尾重申交付边界。"""
+    from p1.helper.tool_calls import SINGLE_FILE_DELIVERY_REMINDER
+
     system, user = template if template is not None else prompt_template()
     user += f'Reference task (read-only):\n```python\n{task["code"]}\n```'
+    # 仅补充末尾提醒，不改变原题、官方 SKILL 或文件块解析规则。
+    user += SINGLE_FILE_DELIVERY_REMINDER
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 

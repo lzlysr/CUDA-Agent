@@ -139,7 +139,7 @@ Docker 客户端为 `/usr/bin/docker`，Docker 管理数据根目录为 `/data2/
 
 1. **保存题单并预检参考任务。** 新运行读取当前 `pilot.json`，复制为该 run 的 `tasks.json`，记录配置、源码哈希及硬件快照。检查参考任务的可运行性、确定性、有限值和近常数输出风险。预检无效题单独记录，不按模型成败换题；因此 12 题不保证全部进入两种模型模式。
 2. **准备工作区。** 放置只读的 `model.py`、上游 `SKILL.md`、固定 `binding.cpp` 和 `binding_registry.h`，候选编写 `model_new.py` 与 `kernels` 下的 CUDA/C++ 源码。模型构造器、参数层级和 `state_dict` 必须兼容参考模型。
-3. **模型生成。** single 一次输出 JSON 多文件源码；agent 先分析原始性能，再使用文件和 Shell 工具开发、编译、验证和优化。
+3. **模型生成。** single 一次输出 `<file path="…">` / `</file>` 原始源码文件块；agent 先分析原始性能，再使用文件和 Shell 工具开发、编译、验证和优化。
 4. **源码快照与实现合同。** 每次评测复制候选源码、记录哈希，检查路径、固定文件和实现约束。主要计算要求 raw CUDA，允许 cuBLAS GEMM、cuDNN 卷积；Python 仅承担分配、元数据和扩展调用，不允许 PyTorch 计算回退、`torch.compile`、Triton、精度状态修改或输出缓存投机。
 5. **编译与搜索反馈。** 用 nvcc 和 PyTorch 扩展构建工具面向 sm_80 编译。参考与候选在独立容器中重建相同输入和参数，严格加载 `state_dict`。外部控制器比较结构、shape、dtype、有限值及逐元素误差；搜索反馈使用 5 个输入，`atol=rtol=0.01`。
 6. **性能与奖励。** 正确候选才进入性能比较。先测候选，再在同一张卡上测 eager 和 compile；只用这组后测基线计算加速比与奖励。不做前后平均或漂移拒绝/重试；零值、非有限或非正耗时仍不产生速度奖励。
@@ -884,7 +884,7 @@ v3 中注意力 Agent 的模型生成调用累计约 4993 秒、109158 token；B
 `turn-XXX.json` 的 `tool_calls` 数组保存该轮所有请求与结果；尚未执行的调用保留
 pending，执行时为 running，有返回时为 completed。中断不会让后续请求从日志中消失。
 多调用批次中 submit 必须放在最后；格式不完整的批次整体不执行，并明确给出错误。
-single 只接受完整的 files JSON，解析失败直接记录失败，不使用 Agent 的格式重试流程。
+single 使用原始源码文件块，结束标签缺失或多余由共享解析器容错；其余解析失败直接记录失败，不使用 Agent 的格式重试流程。旧 run 的 files JSON 是历史交付协议。
 
 ### 16.2 同一工作区、相同 CUDA 规范
 
@@ -1042,7 +1042,7 @@ src/p1/run.py 的 Pilot.prompt() 按消息职责组织模型输入：
 | tools：工具接口 | Pilot.generate() 仍通过 apply_chat_template(..., tools=TOOLS) 传入 | 告诉模型工具名称、参数和用途，执行器保持不变 |
 
 single 和 Agent 均在系统消息中收到完整官方 SKILL；用户消息不重复拼接 SKILL。
-single 的系统消息明确交互流程仅作指导，用户消息仍要求一次输出完整 files JSON，
+single 的系统消息明确交互流程仅作指导，用户消息要求一次输出完整原始源码文件块，
 格式失败不补写、不追加生成。Agent 的工具使用说明移至系统消息，预算与评测规则不变。
 
 这是用户确认后的本地提示词组织调整。论文公开了工具与 SKILL 的总体结构，
@@ -1264,3 +1264,23 @@ GPU 4 实测六项均通过，控制器使用 learner，容器内部使用原 ke
 
 证据：`.runtime/tmp/p1-alignment-20261105/validation.json` 及同名外部日志。
 验通入口最初误用缺少 pyarrow 的 kernel 环境，尚未启动 GPU 即退出，随后改用既有 learner；原启动错误日志单独保留，未通过安装包绕过问题。
+
+## 23. single 原始文件块交付（2026-11-07）
+
+当前 P1 single 与 P2 统一使用 `<file path="相对路径">` / `</file>` 交付原始源码。
+两种标签必须各占一行；源码直接换行，不加 Markdown 围栏，不做 JSON/XML 转义。
+提示词仍要求完整的 `</file>`。解析器容忍结束标签缺失或多余：遇到结束标签、下一个开始标签或回答结束时结束当前文件；多余的独占行结束标签直接跳过。
+
+交付说明集中在 `src/p1/helper/tool_calls.py` 的 `SINGLE_FILE_DELIVERY`，
+P1 `Pilot.prompt` 与 P2 `prompt_template` 直接复用。共享 `parse_single` 返回
+路径→源码字典，然后仍由 `write_files` 检查写入范围和大小，再进入原有 CUDA 评测。
+缺少或畸形开始标签、重复文件、明确闭合后的额外正文、空文件和缺少 model_new.py 均拒绝。缺结束标签时无法仅靠解析判断尾部代码是否完整，仍须编译和正确性验收。
+标签按行匹配，不按 XML 解码，源码中的比较符、模板、引号及普通 `"</file>"` 字符串原样保留。
+
+新 single 不兼容旧 files JSON，只对结束标签容错，不补源码、不追加生成。
+Agent 的原生工具调用及其 JSON 参数保持不变。原官方 SKILL、预算、seed、
+采样参数、奖励、隐藏验收和测时均未调整；未启用 vLLM 语法约束。
+这是本地交付协议，不是论文公开的输出格式；旧 JSON 实验仅作为历史记录保留。
+源码/提示词指纹已变化，需要新 run，不迁移或重计旧结果。
+
+完整规则与本次验证见 [P2_REPORT.md 第 16 节](../p2/P2_REPORT.md#16-2026-11-07single-改用原始文件块交付)。
