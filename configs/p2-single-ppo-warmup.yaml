@@ -1,0 +1,202 @@
+# P2 single PPO warm-up 唯一主配置：项目参数与 verl 原生覆盖放在同一个文件。
+# 运行时路径由入口注入，PPO/GAE/FSDP/同步/检查点由 verl 提供。
+p2:
+  seed: 42
+  model: "models/Qwen3.5-9B"
+  # 训练/rollout 物理卡号。
+  training_gpus: [0, 7]
+  # 复用已验通的 P1 评测协议。
+  kernel_config: "configs/p1-pilot.json"
+  # 评测卡和并发覆盖，正式计时仍独占。
+  kernel_overrides: {"evaluation_gpu": [4, 5], "evaluation_concurrency": 4}
+  # prompt+response 总上下文预算。
+  context_tokens: 32768
+  batch_size: 24
+  mini_batch_size: 12
+  micro_batch_size_per_gpu: 1
+  # 每批 PPO epoch。一批新采样执行一次 PPO epoch。
+  ppo_epochs: 1
+  actor_lr: 3e-5
+  critic_lr: 6e-5
+  lora_rank: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  # 奖励折扣 gamma。
+  gamma: 1.0
+  # GAE lambda。
+  lam: 0.95
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.28
+  temperature: 0.7
+  top_p: 0.95
+  total_steps: 150
+  # 检查点保存间隔。
+  checkpoint_every: 30
+  # 固定检查点隐藏验收间隔。
+  checkpoint_eval_every: 30
+  # 最多保留检查点数。
+  max_checkpoints: -1
+  # 奖励 worker 数。
+  reward_workers: 4
+  # rollout 显存比例。
+  rollout_memory_fraction: 0.45
+  # 本地 Ray CPU 数。
+  ray_cpus: 24
+  # 仅 --wire 的短上下文，不代表已验通 32K。
+  wire_context_tokens: 8192
+  # 仅 --wire 的 batch/minibatch，最多两步。
+  wire_batch_size: 2
+
+# 下方为官方 verl 字段覆盖，直接插值上面的 p2 参数。
+data:
+  train_files: ["data/processed/train.jsonl"]
+  val_files: ["data/processed/test.jsonl"]
+  train_batch_size: "${p2.batch_size}"
+  val_batch_size: "${p2.batch_size}"
+  train_max_samples: -1
+  val_max_samples: -1
+  max_prompt_length: "${p2.prompt_limit}"
+  max_response_length: "${p2.context_tokens}"
+  seed: "${p2.seed}"
+  dataloader_num_workers: 0
+  return_multi_modal_inputs: false
+actor_rollout_ref:
+  model:
+    # 配置类型反序列化时加载项目引擎注册，覆盖所有 Ray GPU worker。
+    _target_: p2.models.CudaHFModelConfig
+    path: "${p2.model_path}"
+    external_lib: "p2.models"
+    override_config:
+      attn_implementation: "flash_attention_2"
+      use_cache: false
+    use_remove_padding: false
+    use_fused_kernels: false
+    lora_rank: "${p2.lora_rank}"
+    lora_alpha: "${p2.lora_alpha}"
+    lora_dropout: "${p2.lora_dropout}"
+    # 按用户选择覆盖全模型适用线性层，包含视觉塔/连接器；输出头由 PEFT 排除。
+    target_modules: "all-linear"
+  actor:
+    strategy: "fsdp2"
+    ppo_mini_batch_size: "${p2.mini_batch_size}"
+    ppo_micro_batch_size_per_gpu: "${p2.micro_batch_size_per_gpu}"
+    ppo_epochs: "${p2.ppo_epochs}"
+    use_torch_compile: false
+    clip_ratio_low: "${p2.clip_ratio_low}"
+    clip_ratio_high: "${p2.clip_ratio_high}"
+    optim:
+      lr: "${p2.actor_lr}"
+    entropy_coeff: 0.0
+    use_kl_loss: false
+    freeze_vision_tower: true
+    fsdp_config:
+      model_dtype: "bf16"
+      strategy: "fsdp2"
+      param_offload: true
+      optimizer_offload: true
+      use_torch_compile: false
+      seed: "${p2.seed}"
+  rollout:
+    name: "vllm"
+    dtype: "bfloat16"
+    tensor_model_parallel_size: "${p2.training_gpu_count}"
+    gpu_memory_utilization: "${p2.rollout_memory_fraction}"
+    enforce_eager: true
+    enable_prefix_caching: true
+    max_model_len: "${p2.context_tokens}"
+    max_num_batched_tokens: "${p2.context_tokens}"
+    max_num_seqs: "${p2.batch_size}"
+    load_format: "safetensors"
+    calculate_log_probs: true
+    logprobs_mode: "raw_logprobs"
+    temperature: "${p2.temperature}"
+    top_p: "${p2.top_p}"
+    seed: "${p2.seed}"
+    log_prob_micro_batch_size_per_gpu: 1
+    engine_kwargs:
+      vllm:
+        # vLLM 原生开关，使视觉塔/连接器适配器与语言适配器一同加载。
+        enable_tower_connector_lora: true
+    agent:
+      num_workers: 4
+      # 生成流程在 p2.rollout 中以 Python 装饰器注册，不再读取额外 YAML。
+      default_agent_loop: "cuda_single"
+    val_kwargs:
+      temperature: "${p2.temperature}"
+      top_p: "${p2.top_p}"
+      do_sample: true
+critic:
+  model:
+    # 与 Actor 使用相同配置扩展，实际 Critic 引擎仍由 value_model 角色选择。
+    _target_: p2.models.CudaHFModelConfig
+    path: "${p2.model_path}"
+    external_lib: "p2.models"
+    override_config:
+      attn_implementation: "flash_attention_2"
+      use_cache: false
+    use_remove_padding: false
+    lora_rank: "${p2.lora_rank}"
+    lora_alpha: "${p2.lora_alpha}"
+    lora_dropout: "${p2.lora_dropout}"
+    target_modules: "all-linear"
+  strategy: "fsdp2"
+  ppo_mini_batch_size: "${p2.mini_batch_size}"
+  ppo_micro_batch_size_per_gpu: "${p2.micro_batch_size_per_gpu}"
+  ppo_infer_micro_batch_size_per_gpu: 1
+  forward_micro_batch_size_per_gpu: 1
+  ppo_epochs: "${p2.ppo_epochs}"
+  optim:
+    lr: "${p2.critic_lr}"
+  fsdp:
+    model_dtype: "bf16"
+    strategy: "fsdp2"
+    param_offload: true
+    optimizer_offload: true
+    use_torch_compile: false
+    seed: "${p2.seed}"
+algorithm:
+  adv_estimator: "gae"
+  gamma: "${p2.gamma}"
+  lam: "${p2.lam}"
+  use_kl_in_reward: false
+reward:
+  num_workers: "${p2.reward_workers}"
+  reward_manager:
+    source: "importlib"
+    name: "CudaRewardManager"
+    module:
+      path: "${p2.root}/src/p2/reward.py"
+transfer_queue:
+  enable: true
+  backend:
+    SimpleStorage:
+      num_data_storage_units: 2
+      total_storage_size: "${p2.queue_capacity}"
+trainer:
+  n_gpus_per_node: "${p2.training_gpu_count}"
+  logger: ["console"]
+  project_name: "CUDA-Agent-P2"
+  experiment_name: "${p2.run_name}"
+  # 宽松循环上限
+  total_epochs: 1000
+  total_training_steps: "${p2.stop_step}"
+  default_local_dir: "${p2.run}/checkpoints"
+  resume_mode: "${p2.resume_mode}"
+  save_freq: "${p2.checkpoint_every}"
+  test_freq: "${p2.checkpoint_eval_every}"
+  val_before_train: true
+  max_actor_ckpt_to_keep: "${p2.max_checkpoints}"
+  max_critic_ckpt_to_keep: "${p2.max_checkpoints}"
+  v1:
+    trainer_mode: "sync"
+    sampler:
+      max_off_policy_threshold: 1
+      custom_sampler:
+        path: "${p2.root}/src/p2/sampler.py"
+        name: "StrictReplayBuffer"
+ray_kwargs:
+  ray_init:
+    num_cpus: "${p2.ray_cpus}"
+    num_gpus: "${p2.training_gpu_count}"
+    include_dashboard: false
+    _temp_dir: "${p2.ray_temp}"
