@@ -54,7 +54,7 @@ train/val，不再把轻量清单当作 val_files 入口；val 的原始记录�
 
 运行清单绑定两份原始文件、训练选题、适配代码、提示词、tokenizer、seed 和上下文。
 config.json 冻结清单路径及摘要；verl-resolved.yaml 保存展开后的绝对输入路径及配置。
-每次正式验证遍历同一份 test；val_batch_size 仅控制每批数量，val_max_samples=-1 表示全量。
+每次正式验证使用从 test 确定性选出的同一批 24 条记录；val_max_samples=24 限制总验证数，val_batch_size 仅控制每批数量。原始 test 文件不改动。
 --wire 仅做短测，关闭训练前和周期性全量验证，避免把完整验证混入接线工作。
 
 当前固定 verl 没有 train/val ratio 启动字段；其示例的比例划分是预处理时调用

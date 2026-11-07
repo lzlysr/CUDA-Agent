@@ -46,7 +46,7 @@ bash scripts/p2-train.sh --run runs/p2/my-wire --wire --steps 2 --resume
 当前 Actor/Critic 使用 `flash_attention_2`、`target_modules: all-linear`，
 LoRA dropout 沿用 PEFT 默认值 0，不提供额外配置或自定义 dropout 接线。PEFT 覆盖语言与视觉的适用线性层，Critic score 头另外完整训练并保存。
 vLLM 使用原生 `enable_tower_connector_lora` 加载视觉适配器；任务仍只有文本，
-视觉层不会因挂上 LoRA 就获得有效视觉训练。正式训练按频率分批遍历全部 test，
+视觉层不会因挂上 LoRA 就获得有效视觉训练。正式训练按频率验证从 test 确定性选出的 24 条记录，
 `--wire` 仅做接线，关闭训练前验证及周期性全量验证。test 已用作训练期间验证，
 其指标应标为验证成绩；当前没有另外保留一份未使用的最终测试集。
 
