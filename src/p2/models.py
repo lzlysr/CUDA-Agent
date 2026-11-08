@@ -2,7 +2,7 @@
 
 由项目模型配置类型及 external_lib 导入，通过公开 EngineRegistry 注册 NVIDIA 引擎。
 不修改 verl、Transformers、PEFT 或 vLLM 源文件。输入为 verl 模型/引擎配置，
-输出为标准 LM logits（Actor）或每 token 一个 value（Critic）。
+Actor 输出由原生 LM/分块概率头提供，Critic 输出每 token 一个 value。
 """
 
 from dataclasses import dataclass

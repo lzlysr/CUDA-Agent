@@ -4,12 +4,12 @@ p2:
   seed: 42
   model: "models/Qwen3.5-9B"
   # 训练/rollout 物理卡号。
-  training_gpus: [6, 7]
+  training_gpus: [2, 5]
   # 复用已验通的 P1 评测协议。
   kernel_config: "configs/p1-pilot.json"
   # 评测卡和并发覆盖，正式计时仍独占。
   kernel_overrides:
-    evaluation_gpu: [4, 5]
+    evaluation_gpu: [4, 3]
     evaluation_concurrency: 4
     # 单例输出/参数快照上限 16 GiB；双输出通道预留 32 GiB，实际空间不足仍停止。
     case_storage_limit_bytes: 17179869184
@@ -75,7 +75,10 @@ actor_rollout_ref:
       attn_implementation: "flash_attention_2"
       use_cache: false
     use_remove_padding: false
-    use_fused_kernels: false
+    # 原生 Torch 分块输出头，避免整段 32K 词表矩阵造成显存峰值。
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: torch
     lora_rank: "${p2.lora_rank}"
     lora_alpha: "${p2.lora_alpha}"
     # 按用户选择覆盖全模型适用线性层，包含视觉塔/连接器；输出头由 PEFT 排除。

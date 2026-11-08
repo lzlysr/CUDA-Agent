@@ -959,3 +959,71 @@ GPU 4 重放最新失败的 CPU/CUDA 混用参考，确认恰好两次失败后�
 已有测试夹具同步移除了旧的“近常数应拒绝”预期，未运行 CPU 回归套件。
 源码语法/配置组合和 git diff --check 已检查。没有加载 Actor/Critic 权重，
 没有启动新的正式 PPO 训练；上述定向结果不等同于已验证完整 150 步训练。
+
+## 19. 原生分块输出头与显存验证（2026-11-08）
+
+### 19.1 改动和原 OOM 原因
+
+`single-ppo-warmup-v2` 在北京时间 15:15:48 的旧策略概率重算阶段失败，
+调用栈为 FSDPEngineWithLMHead → entropy_from_logits → softmax。
+当时进程已用 70.75 GiB，剩余 5.82 GiB，还需申请 30.31 GiB；
+32768×248320×4 字节正好约为 30.31 GiB。旧路径会产生完整词表中间张量。
+
+主 YAML 的 `actor_rollout_ref.model` 现启用 `use_fused_kernels: true`，
+显式选择 `fused_kernel_options.impl_backend: torch`。实际调用本项目固定 verl 中
+`qwen3_5.forward_with_torch_backend` 和 `FusedLinearForPPO`，默认按 512 token
+分块计算输出投影、log_prob 和熵，并分块重算反向，不保留整段词表矩阵。
+Actor/Critic、PPO/GAE、权重同步继续使用原生框架；未修改第三方源码或包版本。
+正式 32768 上下文、batch=24、minibatch=12、每卡 microbatch=1、seed=42 和奖励协议保留。
+本次保留用户已选择的训练 GPU 2、5 和评测 GPU 4、3。
+
+### 19.2 输出头数值和梯度
+
+证据目录：`.runtime/tmp/fused-output-head-20261108/`。
+`probe.py` 对 FP32 的概率、熵、隐状态梯度和词表权重梯度与普通 PyTorch 计算比较，
+最大前向绝对误差约 9.54e-7，最大梯度绝对误差不超过 3.73e-8。
+BF16 真实词表比较通过数值容差；熵输出为 BF16，存在量化舍入，不宣称逐位相等。
+真实 hidden_size=4096、vocab_size=248320 的 32768 token 输出头前后向通过，
+PyTorch 分配峰值 8.34 GiB，隐状态梯度有限。
+这个峰值仅包含输出头测试，不是整个 9B 模型的显存。
+
+### 19.3 完整 9B、32K、双卡 FSDP2 验证
+
+`engine_probe.py` 加载真实 9B 权重，沿用正式 LoRA 和 FSDP2/卸载设置，
+每卡构造一条无 padding 的 32768 token 合成序列，检查带熵的旧概率重算，
+再以原生 PPO loss 做一次前后向和真实优化器更新。
+以下为各进程的 PyTorch 分配峰值，不含其他进程：
+
+| 物理卡 | 32K 旧概率重算峰值 | 32K PPO 更新峰值 | 更新梯度范数 | 改变的抽查 LoRA 分片数 |
+| --- | ---: | ---: | ---: | ---: |
+| GPU 2 | 14.80 GiB | 26.41 GiB | 13.9375 | 248 |
+| GPU 5 | 14.80 GiB | 26.41 GiB | 13.9375 | 248 |
+
+输出概率/熵和梯度有限，抽查 LoRA 参数在原生 optimizer_step 后发生变化。
+合成序列仅验证计算和显存，不提供 CUDA 正确率或训练收益结论。
+
+### 19.4 两步在线 PPO 接线
+
+独立 run：`runs/p2/fused-head-wire-20261108`，最终状态 completed。
+使用当前真实模型、train 中的题和原生 vLLM/奖励器/GAE/Actor/Critic/权重同步，
+临时 profile 采用 --wire 的 8192 总长、每批两题、最多生成 512 token、共两步。
+关闭短测的大型检查点保存和验证，正式主 YAML 的预算及保存策略不变。
+
+| Step | Actor 梯度范数 | Critic 梯度范数 | Actor 分配峰值 | Critic 分配峰值 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 2 | 32.5 | 18.44 GiB | 12.90 GiB |
+| 2 | 1.71094 | 25.125 | 18.75 GiB | 18.44 GiB |
+
+第二批在第一步权重同步后生成，两步更新均完成；结果保留为原生 TensorBoard 和
+`wire.py.log`。短输出可能按格式失败得到 -1，不用于评价 CUDA 生成能力。
+验证期间其他任务也使用训练卡，耗时不作为专属资源下的吞吐基准。
+
+完整证据汇总：`.runtime/tmp/fused-output-head-20261108/validation-result.json`。
+未运行完整 CPU 回归套件，也未自动启动正式 batch=24、150 步训练；
+上述证据证明定向路径通过，不保证今后所有 32K 样本及共享资源状态都不会 OOM。
+
+配置身份已变化，原 v2 保留故障证据且没有检查点，正式运行请使用新目录：
+
+```bash
+bash scripts/p2-train.sh --run runs/p2/single-ppo-warmup-v3
+```
