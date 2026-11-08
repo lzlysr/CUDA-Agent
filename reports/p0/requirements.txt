@@ -2,7 +2,7 @@
 # P1 kernel 补充：transformers 5.9.0、huggingface-hub 1.33.0、tokenizers 0.22.2、safetensors 0.8.0。
 # 下方对应条目已固定版本，不重复声明；它们与当前 learner 版本一致。
 # kernel 按需补充这些包时应冻结既有包版本，不替换 torch/CUDA 栈；不要将整份 learner 清单作为 kernel 重建清单。
-# 本机 FA2 wheel 按 CPython 3.12 / torch 2.11 / cu129 / A100(sm80) 构建，仅供 learner 使用。
+# 本机 FA2 和 causal-conv1d wheel 使用 CPython 3.12 / torch 2.11 / cu129 构建，支持 A100(sm80)，仅供 learner 使用。
 # pip install -r 时优先使用该 wheel；其他机器需按其 torch/CUDA 重新构建。
 --find-links /home/likun/junjxu/CUDA-Agent/.runtime/cache/wheels
 -e /home/likun/junjxu/CUDA-Agent/third_party/verl
@@ -72,6 +72,8 @@ blake3==1.0.11
     # via vllm
 cachetools==7.2.2
     # via vllm
+# P2 Qwen3.5 GatedDeltaNet 的因果卷积快速路径；优先复用上方 find-links 中的本机 wheel。
+causal-conv1d==1.7.0
 cbor2==6.1.5
     # via vllm
 certifi==2026.7.22
@@ -175,8 +177,12 @@ filelock==4.2.0
     #   torch
     #   virtualenv
     #   vllm
+# P2 Qwen3.5 线性注意力的核心算子，随 flash-linear-attention 固定版本。
+fla-core==0.6.0
 # P2 Transformers Actor/Critic 的 FlashAttention-2 后端。
 flash-attn==2.8.3.post2
+# P2 Qwen3.5 GatedDeltaNet 快速路径；CUDA extra 复用本清单既定的 torch/triton。
+flash-linear-attention[cuda]==0.6.0
 flashinfer-cubin==0.6.8.post1
     # via vllm
 flashinfer-python==0.6.8.post1

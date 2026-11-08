@@ -93,3 +93,37 @@ P0 测试命令使用 `scripts/set-env.sh` 配置 GPU 4、CUDA 12.9 和项目内
 本轮通过的是环境与模型的单卡组件检查，以及可信 CUDA fixture 的编译、隔离执行与校验。没有启动 Ops-6K、RFT、value pretraining、正式 PPO、比赛评测或完整 Agent rollout；没有验证多卡 FSDP、分布式权重同步、8K/32K 训练、通用模型生成 kernel 的完整评测闭环，也没有据此声称复现论文指标或解决 reward hacking。后续阶段需另行开展这些工作。
 
 维护更新：已移除 `scripts/activate.sh`，使用标准 conda activate；环境变量脚本名为 `scripts/set-env.sh`。verl 的 Git 元数据及其备份已删除，源码未变，原始提交记录于本报告上表。已删除旧依赖输入文件，锁文件更名为 `requirements.txt`；临时目录及 Conda 包缓存已清理，后续使用时可重新创建。
+
+
+## learner 线性注意力加速依赖补齐（2026-11-08）
+
+维护时间：2026-11-08T10:54:24.726881+08:00。上文为 P0 初验记录，本节记录后续 P2 所需的 learner 加速依赖。
+
+| 新增包 | 固定版本 | 用途 |
+|---|---|---|
+| flash-linear-attention | 0.6.0，启用 cuda extra | Qwen3.5 GatedDeltaNet 的快速算子 |
+| fla-core | 0.6.0 | FLA 核心算子与 fused RMSNormGated |
+| causal-conv1d | 1.7.0 | 线性注意力层中的因果卷积 |
+
+torch 2.11.0+cu129、triton 3.6.0、Transformers 5.9.0、vLLM 0.21.0+cu129、
+flash-attn 2.8.3.post2 及其余既有 Python 包版本全部保持不变。
+没有修改第三方包源码、系统 CUDA、kernel 环境或 Docker 镜像。
+
+causal-conv1d 使用官方 1.7.0 源码，在当前 learner 的 torch/C++11 ABI 下，明确使用
+`/usr/local/cuda-12.9` 编译；原始构建脚本包含 sm80。三个 wheel 均缓存于
+`.runtime/cache/wheels`，由 requirements.txt 现有 find-links 复用；完整 wheel 哈希
+和安装前后核对结果保存在 `.runtime/tmp/linear-attention-install-20261108/after.json`。
+安装前后 pip check 均通过，没有更换其他依赖。
+
+GPU 4 验证了 CUDA 因果卷积的输出/输入梯度/权重梯度，并使用 Qwen3.5-9B 本机配置
+实例化原生 GatedDeltaNet 层（hidden=4096，key/value heads=16/32，head_dim=128）。
+BF16、batch=2、sequence=128、带 padding mask 的前向和反向通过，全部
+9 个可训练参数梯度有限；
+快速路径与普通 PyTorch 路径的输出最大绝对差为
+0.00390625，输入梯度最大绝对差为
+0.00015258789。
+Transformers 的 `is_fast_path_available=True`，本层使用已安装的 FLA 和 causal-conv1d。
+
+证据：`.runtime/tmp/linear-attention-install-20261108/gpu-validation.json`。
+本次没有加载完整 9B 权重或启动 PPO，没有据此声称完整 32K/FSDP2 训练已经验证，
+也没有测量端到端训练加速比。新启动的 learner 进程会加载这些优化实现。
