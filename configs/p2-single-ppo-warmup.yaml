@@ -8,7 +8,11 @@ p2:
   # 复用已验通的 P1 评测协议。
   kernel_config: "configs/p1-pilot.json"
   # 评测卡和并发覆盖，正式计时仍独占。
-  kernel_overrides: {"evaluation_gpu": [4, 5], "evaluation_concurrency": 4}
+  kernel_overrides:
+    evaluation_gpu: [4, 5]
+    evaluation_concurrency: 4
+    # 单例输出/参数快照上限 16 GiB；双输出通道预留 32 GiB，实际空间不足仍停止。
+    case_storage_limit_bytes: 17179869184
   # prompt+response 总上下文预算。
   context_tokens: 32768
   batch_size: 24
@@ -196,6 +200,13 @@ trainer:
     trainer_mode: "sync"
     sampler:
       max_off_policy_threshold: 1
+      # 原生数据加载按单题取样，失败时精确补足，不填充伪造轨迹。
+      sync_refill_failed_groups: true
+      sampler_kwargs:
+        run: "${p2.run}"
+        train_batch_size: "${p2.batch_size}"
+        # 每批最多额外丢弃 4 倍 batch_size，避免全无效题时无限补采。
+        max_resample_factor: 4
       custom_sampler:
         path: "${p2.root}/src/p2/sampler.py"
         name: "StrictReplayBuffer"

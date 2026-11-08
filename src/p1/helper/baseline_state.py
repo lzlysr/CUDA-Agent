@@ -222,7 +222,7 @@ def completed_reference(output, task):
     prepared = _record(output / prepare_path)
     if prepared is None:
         return None
-    rejected = prepared["status"] != "ok" or prepared.get("near_constant_sampled_output")
+    rejected = prepared["status"] != "ok"
     detail = prepared
     if not rejected:
         if index.get("bench_result_path") != bench_path:

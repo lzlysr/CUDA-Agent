@@ -53,6 +53,9 @@ def compose_config(project, run, data_paths, steps=None, resume=False, config_pa
     }
     config.data.p2_input_manifest = str(ROOT / project["data_manifest"])
     config.data.p2_input_manifest_hash = project["data_manifest_hash"]
+    # 当前单轮 PPO 每题只生成一条轨迹，保证失败组不会残留可用于补齐的半组数据。
+    if int(config.actor_rollout_ref.rollout.n) != 1 or int(config.actor_rollout_ref.rollout.val_kwargs.n) != 1:
+        raise ValueError("P2 single 当前要求 train/val rollout.n=1")
     if project["wire"]:
         # --wire 只验证接线，不在第一步前执行整个 test 集的正式验证。
         config.trainer.val_before_train = False
@@ -133,13 +136,14 @@ def main():
     from p1.evaluation import Evaluator
     Evaluator(project["kernel"], run / "kernel", gpu=project["kernel"]["evaluation_gpu"][0])
     import ray
-    from verl.trainer.main_ppo import TaskRunnerV1, run_ppo
+    from verl.trainer.main_ppo import run_ppo
+    from p2.trainer import CudaTaskRunner
     from verl.trainer.ppo.utils import need_critic, need_reference_policy
     from verl.utils.config import validate_config
     validate_config(config, use_reference_policy=need_reference_policy(config), use_critic=need_critic(config))
     try:
         write_json(run / "status.json", {"status": "running", "at": now().isoformat(), "wire": args.wire})
-        run_ppo(config, TaskRunnerV1)
+        run_ppo(config, CudaTaskRunner)
         write_json(run / "status.json", {"status": "completed", "at": now().isoformat(), "wire": args.wire})
     except BaseException as error:
         write_json(run / "status.json", {"status": "failed", "at": now().isoformat(),

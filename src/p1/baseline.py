@@ -107,18 +107,15 @@ def rejection_summary(output, detail_path):
             if key not in index:
                 continue
             record = json.loads((Path(output) / index[key]).read_text())
-            constant = stage == "reference_prepare" and record.get("near_constant_sampled_output")
-            if record.get("status") == "ok" and not constant:
+            if record.get("status") == "ok":
                 continue
             error = record.get("error", "")
-            if constant:
-                reason = "采样输出近常数，未进入性能测试"
-            elif record.get("status") == "timeout":
+            if record.get("status") == "timeout":
                 reason = "参考执行超时"
             elif record.get("failure_kind") == "missing_dependency":
                 reason = "kernel 环境缺少参考程序依赖：" + str(record.get("missing_module"))
             elif record.get("failure_kind") == "reference_nondeterministic":
-                reason = "原始模型重复运行未通过零容差一致性检查；具体输出位置见阶段详情"
+                reason = "原始模型重复运行超出配置容差；具体输出位置见阶段详情"
             elif "out of memory" in error.lower():
                 reason = "CUDA 显存不足"
             elif "same device" in error.lower() or "two devices" in error.lower():

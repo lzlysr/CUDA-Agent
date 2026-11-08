@@ -279,7 +279,7 @@ def prepare(cfg):
                 if isinstance(x, torch.Tensor):
                     floating = x.is_floating_point() or x.is_complex()
                     # 显式检查浮点输出中是否存在 NaN 或 Inf。
-                    if floating and not torch.isfinite(x).all():
+                    if floating and not (torch.isfinite(x).all() and torch.isfinite(y).all()):
                         raise ReferenceValidationError(
                             "reference_nonfinite", f"Reference has nonfinite output at {context}"
                         )
@@ -312,6 +312,12 @@ def prepare(cfg):
                         equal(x[k], y[k], f"{path}[{k!r}]")
                 # 普通标量使用精确相等断言。
                 else:
+                    if isinstance(x, (float, complex, np.floating, np.complexfloating)) and not (
+                        np.isfinite(x) and np.isfinite(y)
+                    ):
+                        raise ReferenceValidationError(
+                            "reference_nonfinite", f"Reference has nonfinite scalar at {context}"
+                        )
                     if x != y:
                         raise ReferenceValidationError(
                             "reference_nondeterministic", f"Reference scalar output changed at {context}"
@@ -354,19 +360,7 @@ def prepare(cfg):
         del m
         # 释放缓存分配器中已不用的显存；不会释放仍有引用的活跃张量。
         torch.cuda.empty_cache()
-    # 展开各初始化/输入/输出张量的采样数组，只保留非空张量。
-    arrays = [v["sample"] for m in metadata for o in m["output_audits"] for v in o if v["numel"]]
-    # 没有可检查的张量采样时，默认不标记近常数。
-    constant = False
-    # 存在有效采样数组时，再执行近常数判断。
-    if arrays:
-        # 以第一份采样的第一个值作为共同参照值。
-        anchor = arrays[0][0]
-        # 检查所有采样值是否都落在同一个参照值的绝对/相对容差范围内。
-        constant = all(
-            abs(v - anchor) <= cfg["atol"] + cfg["rtol"] * abs(anchor) for a in arrays for v in a
-        )
-    # 所有确定性/近常数判定已使用完整采样完成；落盘只保存摘要，不重复存数千个浮点数。
+    # 输出采样仅保留审计摘要，不再据此判断或拒绝近常数题。
     for entry in metadata:
         for audits in entry["output_audits"]:
             for audit in audits:
@@ -381,8 +375,6 @@ def prepare(cfg):
                 )
     # 返回准备阶段的审计结果，供宿主决定是否接受这道题。
     return {
-        # 这是基于采样值的近常数标记，宿主据此过滤退化题。
-        "near_constant_sampled_output": constant,
         # 保留逐初始化、逐输入的形状、dtype 和采样摘要。
         "metadata": metadata,
         # 反馈阶段的基础案例数量。

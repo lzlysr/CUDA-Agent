@@ -11,6 +11,43 @@ import shutil
 import uuid
 
 from p2.common import ROOT, now, write_json
+from p2.failures import RecoverableSampleError, check_quarantine, record_failure
+from p1.evaluation import InfrastructureError, ReferenceTaskError
+from p1.helper.pilot_parallel import ParallelEvaluator
+from p1.helper.rewards import environment_failure
+
+
+class P2Evaluator(ParallelEvaluator):
+    """只扩展参考准备/初始基线的有限重试；候选和 PPO 算法沿用已有实现。"""
+
+    def container(self, mode, out, **kwargs):
+        """输入原容器参数；参考准备/初始基线最多两次，保留失败证据后返回最终结果。
+
+        后测基线和参考流已有控制器整次重试，不在这里叠加次数。
+        OOM、异常退出、缺依赖、空间不足立即停止；数值不稳定/非有限立即隔离。
+        """
+        retryable_stage = mode == "reference_prepare" or (
+            mode == "reference_bench" and Path(out).name == "initial-bench"
+        )
+        for attempt in range(2 if retryable_stage else 1):
+            result = super().container(mode, out, **kwargs)
+            if result.get("failure_kind") == "storage_limit":
+                raise InfrastructureError(f"输出/参数传输容量超限：{result}; details={out}")
+            if mode.startswith("reference_") and (
+                environment_failure(result) or result.get("failure_kind") == "missing_dependency"
+            ):
+                raise InfrastructureError(f"参考环境失败：{result}; details={out}")
+            if (result["status"] == "ok" or not retryable_stage or attempt == 1
+                    or result.get("failure_kind") in {"reference_nondeterministic", "reference_nonfinite"}):
+                return result
+            # 仅保存失败尝试，最终结果仍保留标准文件名，防止重试覆盖根因。
+            archive = Path(out) / "retry-1"
+            archive.mkdir(exist_ok=True)
+            result_name = "prepare_result.json" if mode == "reference_prepare" else "bench_result.json"
+            for name in (result_name, "worker.log"):
+                source = Path(out) / name
+                if source.exists():
+                    source.replace(archive / name)
 
 
 def compact_evaluation_result(run, evaluation):
@@ -80,9 +117,8 @@ def evaluate_response(config, response, task, hidden=False):
     每次请求保存原始回答和结果索引；源码只长期保留评测快照，完整快照写好后清理工作区。
     同题请求持锁保护参考输入，测速独占评测卡；继续清理 input-spec、compile-cache。
     """
-    from p1.evaluation import InfrastructureError
     from p1.helper.baseline_state import cleanup_reference_artifacts
-    from p1.helper.pilot_parallel import EvaluationPool, ParallelEvaluator, blocking_lock
+    from p1.helper.pilot_parallel import EvaluationPool, blocking_lock
     from p1.helper.rewards import training_reward
     from p1.helper.tool_calls import parse_single
     from p1.run import write_files
@@ -95,10 +131,11 @@ def evaluate_response(config, response, task, hidden=False):
     evaluator_run = run / "kernel"
     # 初始化只写独立工作区；公共配置由训练入口创建，避免多 reward worker 相互覆盖。
     pool = EvaluationPool(cfg["evaluation_gpu"], run / "scheduler", cfg=cfg)
-    evaluator = ParallelEvaluator(cfg, evaluator_run, pool)
+    evaluator = P2Evaluator(cfg, evaluator_run, pool)
     evaluation = acceptance = None
     reference_failure = None
     try:
+        check_quarantine(config, task["task_id"])
         try:
             files = parse_single(response)
             workspace = request / "workspace"
@@ -123,22 +160,23 @@ def evaluate_response(config, response, task, hidden=False):
                             "preflight_status": preflight["status"],
                             "failure_kind": detail.get("failure_kind", "reference_invalid"),
                             "error_type": detail.get("error_type"),
-                            "error": detail.get("error") or (
-                                "reference output rejected as near-constant"
-                                if detail.get("near_constant_sampled_output")
-                                else f"reference stage returned {detail.get('status')}"
-                            ),
+                            "error": detail.get("error") or f"reference stage returned {detail.get('status')}",
                             "detail_path": detail_path.relative_to(run).as_posix(),
                         }
-                        raise InfrastructureError(
+                        raise RecoverableSampleError(
                             f"参考预检失败：task_id={task['task_id']}; "
                             f"status={preflight['status']}; "
                             f"failure_kind={reference_failure['failure_kind']}; "
                             f"{reference_failure['error_type']}: {reference_failure['error']}; "
-                            f"detail_path={detail_path}"
+                            f"detail_path={detail_path}", detail_path, quarantine=True,
                         )
-                    evaluation = evaluator.evaluate(task, workspace)
-                    acceptance = evaluator.evaluate(task, workspace, final=True) if hidden and evaluation.get("correct") else None
+                    try:
+                        evaluation = evaluator.evaluate(task, workspace)
+                        acceptance = evaluator.evaluate(task, workspace, final=True) if hidden and evaluation.get("correct") else None
+                    except ReferenceTaskError as error:
+                        raise RecoverableSampleError(
+                            str(error), error.detail_path, quarantine=True,
+                        ) from error
                     result = dict(training_reward(evaluation, acceptance), correct=bool(evaluation.get("correct")))
                     result["speedup_eager"] = evaluation.get("speedup_eager")
                     result["speedup_compile"] = evaluation.get("speedup_compile")
@@ -174,7 +212,13 @@ def evaluate_response(config, response, task, hidden=False):
         # 原阶段文件保留完整 traceback；样本索引保存底层分类、原因及相对 run 的详情路径。
         if reference_failure is not None:
             failure["reference_failure"] = reference_failure
-        write_json(request / "infrastructure-error.json", failure)
+        recoverable = isinstance(error, RecoverableSampleError)
+        failure["recoverable"] = recoverable
+        failure["detail_path"] = getattr(error, "detail_path", None)
+        name = "discarded.json" if recoverable else "infrastructure-error.json"
+        write_json(request / name, failure)
+        # 每题原始证据保存在 samples；队列索引引用这里，阶段路径在该文件中保留。
+        error.detail_path = str(request / name)
         raise
 
 
@@ -197,7 +241,13 @@ class CudaRewardManager(RewardManagerBase):
         response_ids = item.batch["responses"]
         length = int(item.batch["attention_mask"][-response_ids.shape[-1]:].sum())
         if length <= 0:
-            raise ValueError("空 response 无法放置终局奖励，停止本批次")
+            from omegaconf import OmegaConf
+            config = OmegaConf.to_container(self.config.p2, resolve=True)
+            task = json.loads(item.non_tensor_batch["extra_info"]["task_json"])
+            error = RecoverableSampleError("奖励阶段发现真正零 token，丢弃并补采")
+            record_failure(config, item.non_tensor_batch["uid"], task["task_id"], error,
+                           hidden=bool(item.non_tensor_batch["extra_info"].get("hidden", False)))
+            raise error
         tokens = response_ids[:length].tolist()
         # 仅移除实际 EOS；保留 <think>/</think>，严格解析器用它排除推理区 JSON。
         while tokens and tokens[-1] == self.tokenizer.eos_token_id:
@@ -207,7 +257,12 @@ class CudaRewardManager(RewardManagerBase):
         from omegaconf import OmegaConf
         config = OmegaConf.to_container(self.config.p2, resolve=True)
         task = json.loads(extra["task_json"])
-        result = await self.loop.run_in_executor(
-            None, lambda: evaluate_response(config, response, task, bool(extra.get("hidden", False)))
-        )
+        try:
+            result = await self.loop.run_in_executor(
+                None, lambda: evaluate_response(config, response, task, bool(extra.get("hidden", False)))
+            )
+        except Exception as error:
+            record_failure(config, item.non_tensor_batch["uid"], task["task_id"], error,
+                           hidden=bool(extra.get("hidden", False)))
+            raise
         return {"reward_score": result.pop("score"), "reward_extra_info": result}

@@ -23,11 +23,11 @@ Actor→vLLM 权重同步和检查点均使用 verl 原生实现，不重新实�
 | `src/p2/common.py`                  | 配置验证、北京时间、原子 JSON、配置身份                                      |
 | `src/p2/data.py`                    | train 选题、公共提示词、CPU 静态/长度检查和轻量运行清单                      |
 | `src/p2/dataset.py`                 | verl 公共 Dataset 扩展；从原始 train 读取记录，取样时补充 prompt/奖励字段    |
-| `src/p2/train.py`                   | 加载官方配置与 YAML 覆盖、选择 GPU、调用 `run_ppo(..., TaskRunnerV1)`      |
+| `src/p2/train.py`                   | 加载官方配置与 YAML 覆盖、选择 GPU、调用原生 `run_ppo`，由 `CudaTaskRunner` 选择验证口径子类      |
 | `src/p2/reward.py`                  | 严格解析最终源码，调用 P1 沙箱并产生有效终局奖励                             |
 | `src/p2/models.py`                  | 继承原生模型/价值头加载，仅补齐 Critic LoRA 角色与文本接线；Actor LoRA、优化器与指标使用原生实现       |
 | `src/p2/rollout.py`                 | 用公开 register 注册单轮生成流程：固定 seed，限制总长，保留真实 token        |
-| `src/p2/sampler.py`                 | 公开 custom_sampler 扩展：后台环境异常立即终止批次，拒绝伪造零奖励           |
+| `src/p2/sampler.py`                 | 公开 custom_sampler 扩展：可恢复单题失败用原生补采，环境异常仍停止           |
 
 最后几个适配文件没有实现 PPO/GAE。模型实现仍为 Transformers 原生类；
 优化器、FSDP 与采样服务均来自既有框架。项目不改动 verl/vLLM/torch/CUDA 包源码。
@@ -510,7 +510,7 @@ P2 奖励先用完整内存评测结果计算，之后才精简磁盘总结果�
 普通文件清理失败记录 workspace_cleanup_error，不把已有效计算的模型奖励改成负分。
 既有 input-spec/compile-cache 完成后清理逻辑保持不变。
 
-worker.prepare 仍使用原有完整采样进行确定性/近常数判定；判定结束后才把持久化采样
+worker.prepare 保留审计采样和参考一致性检查（使用配置容差），现已取消近常数筛选；持久化采样
 转换为数量、最小/最大值、SHA256 等摘要，保留 shape/dtype/numel 及判定结论。
 worker 日志仅输出阶段、状态、结果文件位置、耗时及错误/traceback，不再重复整份结果 JSON。
 此 worker 是 P1/P2 共用入口，因此两者后续预检审计和终端日志均使用精简形式；
@@ -842,9 +842,9 @@ P2 奖励阶段若参考预检失败，异常明确给出 task_id、preflight �
 reference_failure，包含 preflight_status、failure_kind、error_type、error、
 detail_path。detail_path 相对于本次 run；原阶段结果继续保留完整 traceback。
 
-当前失败保护策略保留：实际抽到并走到 GPU 参考检查的 train 或 val 题，若其参考
-无法评分，会停止当前 run；没有遍历执行的题不会触发。候选格式、编译或数值
-失败仍是正常有效 -1。初始验证最多 24 条，不代表准备时执行了整个 test。
+本节记录容差修复当时的策略；参考任务失败的当前处理已按第 18 节改为隔离、
+有限重试与补采。候选格式、编译或数值失败仍是正常有效 -1。初始验证最多
+24 条，不代表准备时执行了整个 test。
 
 本次在 GPU 4 独立验证：原出错参考 ops6k-f05dde20a8f3f503 的 reference_prepare
 通过，近常数标记为 false，控制器耗时约 4.92 秒，使用原配置 atol=rtol=0.01。
@@ -853,3 +853,109 @@ detail_path。detail_path 相对于本次 run；原阶段结果继续保留完�
 ReferenceValidationError、具体差异、实际容差及可访问的详情路径。两项均在
 `.runtime/tmp/reference-tolerance-20261108/` 独立目录执行，不回写旧 run。
 未运行参考测时、候选 CUDA 评测、模型 rollout、PPO 或 CPU 回归套件。
+
+
+## 18. 单题隔离、有限重试与原生补采（2026-11-08）
+
+### 18.1 最新失败与前次的区别
+
+`runs/p2/single-ppo-warmup/status.json` 的最新失败时间为北京时间
+2026-11-08 01:09:07，仍发生在 `val_before_train`，尚未进行 PPO 参数更新。
+本次不是之前的零容差误判：`ops6k-72d8c10fb5385f89` 的原始参考程序在
+`index_select` 中混用 CPU 索引与 CUDA 张量，直接抛出 RuntimeError。
+详情位于该 run 的
+`kernel/references/ops6k-72d8c10fb5385f89/cases/prepare_result.json`，
+样本证据为 `samples/7a927989975845ceaf6ab25dd7af9b23/infrastructure-error.json`。
+此前出错的 `ops6k-f05dde20a8f3f503` 本轮已走过参考预检，之后因候选合同违规得到 -1。
+
+该 run 已完成的 20 条样本全部为有效 -1：12 条编译失败、6 条合同违规、2 条数值错误。
+这些模型失败本来不会使训练停止；导致停止的是旧 sampler 对任何失败组一律报错。
+旧 run、状态和样本结果保留，不用新策略覆盖或重评分。
+
+### 18.2 当前失败处理表
+
+| 情况 | 当前处理 | 是否给模型奖励 |
+|---|---|---|
+| 参考重复输出超出 atol/rtol，参考包含 NaN/Inf | 隔离该题，训练丢弃并补采 | 否 |
+| 参考普通执行失败、初始参考基线失败 | 最多执行两次，仍失败则隔离该题 | 否 |
+| 参考输出流失败或后测 eager/compile 基线失败 | 控制器最多完整尝试两次，仍失败则隔离该题 | 否 |
+| 真正 response token 数为 0 | 丢弃本次请求并补采，不隔离题目 | 否 |
+| OOM、worker 异常退出、基础依赖缺失、未分类后台异常 | 停止整个 run，保留原始证据 | 否 |
+| 实际传输空间不足、输出/参数快照容量超限 | 停止整个 run | 否 |
+| 候选格式、编译、数学/索引/正确性错误、违规 PyTorch 回退 | 正常作为已评分轨迹交给 PPO | -1 |
+
+当前参考浮点重复输出仍用 atol=rtol=0.01，整数/布尔/普通标量的一致性与
+输出结构检查保留。预检检查张量和数值标量中的非有限值；正式参考输出流也
+在控制器读取时独立检查 NaN/Inf，避免候选类型错误掩盖参考自身不可评分。
+空间不足或任一端 OOM/异常退出优先于单题恢复，不会被参考重试吞掉。
+后测基线仍是唯一速度和奖励基准；固定 seed、五组反馈和 1×10 测时不变。
+
+### 18.3 为什么仍有少量本地适配
+
+`src/p2/sampler.py` 使用官方 custom_sampler 扩展，训练失败组的剔除、精确补采、
+完整批次等待与轨迹 materialize 由原生 ReplayBuffer 完成；配置显式启用
+`trainer.v1.sampler.sync_refill_failed_groups=true`，原生数据加载按单题获取替补。
+每题 train/val 的 rollout.n 当前均要求为 1，防止失败组的部分轨迹被补齐进入 PPO。
+
+`src/p2/failures.py` 只负责错误分类、按原始 verl UID 保存失败索引及本次 run 的
+隔离题目。rollout 在再次遇到已隔离题时直接跳过生成，继续由原生机制补采；
+零 token 只丢弃请求，不将同一题永久列入隔离。EOS-only 或解码后空文本而实际
+含有 token 的回答不属于“零 token”，仍按正常候选处理，通常获得格式失败 -1。
+
+`src/p2/trainer.py` 的子类只调整验证指标分母和覆盖率记录：原生验证会将缺失
+回答纳入部分 acc 指标的期望分母，这与用户要求“无效题跳过”不同。通过官方
+`run_ppo(..., task_runner_class)` 接口选择子类，初始化/清理遵循原生 TaskRunner，
+训练 fit、PPO、GAE、反向传播、优化器、LoRA 和权重同步均继承官方实现；
+未修改 `third_party/verl`、vLLM、torch 或 CUDA 包。
+
+验证集不补题；指标只用本轮有效轨迹，另记录 requested、valid、skipped。
+如果某个验证批次全部无效，本轮标为 incomplete，不伪造正确率，也不因此阻止训练。
+当前默认 24 题为一个验证批次；若今后扩大为多批，遇到全无效批次会将整轮验证
+标为 incomplete，不把已完成部分冒充完整验证结果。比较不同检查点时应同时查看
+覆盖率和跳过题目，分母变化时不能只比较正确率数字。
+
+为避免全无效题或持续零输出造成无限补采，`sampler_kwargs.max_resample_factor=4`：
+每个训练批次最多额外丢弃 4×batch_size 条请求，当前为 96 条；超过后停止并明确报告。
+它不是参考执行的重试次数，两者相互独立。
+
+### 18.4 输出、容量与启动注意
+
+- `samples/<sample_id>/discarded.json`：可恢复的单题丢弃，保留原始错误和阶段详情路径。
+- `samples/<sample_id>/infrastructure-error.json`：仍需停止的环境或协议错误。
+- `scheduler/failures/<verl_uid>.json`：精确关联队列失败组，防止历史日志串用。
+- `scheduler/quarantine/<task_id>.json`：本次 run 已确认不可评分的参考题；不改原始数据集。
+- `validation/step-<step>-coverage.json`：每轮验证的有效数、跳过数及跳过原因。
+- 参考准备/初始基线的第一次失败日志放在阶段目录的 `retry-1/`，最终结果沿用标准文件名。
+
+P2 的 `kernel_overrides.case_storage_limit_bytes` 从 8 GiB 提至 16 GiB；候选与参考
+两个输出槽位合计预留 32 GiB，四个活动评测合计最多登记 128 GiB。它是容量上限和
+协作预留，不会立即分配这些空间；实际可用空间不足仍停止。P1 独立配置未提高该上限。
+
+配置已变化，旧 run 仍冻结原配置；请用新 run 目录启动。这里不自动重启正式训练，
+也不将此前未完成的验证包装成一轮完成的训练。
+
+### 18.5 移除近常数筛选的含义
+
+P1/P2 已删除近常数判定及所有新结果的 `near_constant_sampled_output` 字段，
+预检成功的合法常数输出也能进入性能评测。输出形状/dtype、有限值、重复一致性、
+五组输入比较、已有隐藏验收、真实 CUDA/允许库调用、状态污染审查均保留。
+
+这不会使 PPO 在数学上失效，但增加容差范围内常数近似、输入无关实现获取奖励的风险。
+完全常数且数学正确的任务本身可以合法优化；风险主要是“仅在有限验收输入/容差下
+看似正确”的投机。训练只用五组反馈，隐藏验收在检查点运行，不能保证完全排除投机。
+该筛选是本地额外启发式，与 Ops-6K 已做的数据去污染不是同一件事。
+
+
+### 18.6 定向验证与边界
+
+独立证据目录：`.runtime/tmp/p2-recovery-20261108/probe-20261108T100209/`。
+GPU 4 重放最新失败的 CPU/CUDA 混用参考，确认恰好两次失败后转入隔离，无模型奖励；
+真实 GPU 常数参考预检通过，不再有近常数字段；NaN 参考仍报告 reference_nonfinite。
+原生 TransferQueue 联调确认两条失败组被剔除并精确补足两条真实轨迹；零 token
+生成结果在 rollout 边界注入后进入丢弃分支。致命环境错误和未知后台失败继续停止。
+验证一有效、一无效时，正确率分母为 1，覆盖记录为 requested=2、valid=1、skipped=1；
+全无效批次没有伪造输出轨迹。具体断言结果保存在该目录的 probe-result.json。
+
+已有测试夹具同步移除了旧的“近常数应拒绝”预期，未运行 CPU 回归套件。
+源码语法/配置组合和 git diff --check 已检查。没有加载 Actor/Critic 权重，
+没有启动新的正式 PPO 训练；上述定向结果不等同于已验证完整 150 步训练。

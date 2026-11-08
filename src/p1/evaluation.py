@@ -42,7 +42,18 @@ class InfrastructureError(RuntimeError):
     pass
 
 
-class _ReferenceStreamFailure(InfrastructureError):
+class ReferenceTaskError(InfrastructureError):
+    """参考任务有限重试后仍不可评分；P1 保持报错，P2 可隔离并补采。
+
+    输入错误消息和可选详情路径；保留底层证据，不产生模型奖励。
+    """
+
+    def __init__(self, message, detail_path=None):
+        super().__init__(message)
+        self.detail_path = str(detail_path) if detail_path else None
+
+
+class _ReferenceStreamFailure(ReferenceTaskError):
     """参考流失败的内部标记；外层释放共享租约后按原协议完整重试一次。"""
 
 
@@ -54,6 +65,26 @@ from .contract import audit_contract, contract
 # actual 是候选输出，expected 是原始 PyTorch 参考输出；调用方负责把输出放在 CPU。
 # atol 是绝对容差，rtol 是相对容差；本函数不运行模型，也不接触候选的判定逻辑。
 # 返回字典供控制器记录正确性、最大误差、非有限值情况与错误发生的位置。
+def finite_reference(value):
+    """输入已读取的 CPU 参考输出树；分块检查 NaN/Inf，返回是否全部有限。
+
+    独立于候选的类型/形状进行检查，防止候选类型错误掩盖参考自身无效。
+    """
+    if isinstance(value, torch.Tensor):
+        if not (value.is_floating_point() or value.is_complex()):
+            return True
+        flat = value.reshape(-1)
+        return all(bool(torch.isfinite(flat[i:i + 8 * 1024 * 1024]).all())
+                   for i in range(0, flat.numel(), 8 * 1024 * 1024))
+    if isinstance(value, (list, tuple)):
+        return all(finite_reference(item) for item in value)
+    if isinstance(value, dict):
+        return all(finite_reference(item) for item in value.values())
+    if isinstance(value, (float, complex)):
+        return math.isfinite(value.real) and math.isfinite(value.imag)
+    return True
+
+
 def compare(actual, expected, atol=0.01, rtol=0.01):
     """输入候选/参考输出树及绝对/相对容差；返回 passed、误差摘要及逐层错误。"""
     # 积累各输出节点的错误；递归遇到不匹配时记录路径，而不是立即终止整棵树的检查。
@@ -458,7 +489,7 @@ class Evaluator:
             "status": "task_invalid",
             "prepare_result_path": (ref / "cases/prepare_result.json").relative_to(self.run).as_posix(),
         }
-        if prepared.get("failure_kind") == "missing_dependency":
+        if environment_failure(prepared) or prepared.get("failure_kind") == "missing_dependency":
             preflight["status"] = "infrastructure_error"
             dump(ref / "preflight.json", preflight)
             raise InfrastructureError(
@@ -466,8 +497,8 @@ class Evaluator:
                 f"{prepared.get('missing_module') or prepared.get('error')}; "
                 f"see {preflight['prepare_result_path']}"
             )
-        # 仅预检正常且没有近常数退化时继续测量，具体拒绝原因保留在预检结果中。
-        if prepared["status"] == "ok" and not prepared.get("near_constant_sampled_output"):
+        # 近常数也可能是合法输出；参考预检成功后统一进入测时。
+        if prepared["status"] == "ok":
             bench = self.container(
                 "reference_bench",
                 ref / "initial-bench",
@@ -478,7 +509,7 @@ class Evaluator:
             preflight["bench_result_path"] = (
                 (ref / "initial-bench/bench_result.json").relative_to(self.run).as_posix()
             )
-            if bench.get("failure_kind") == "missing_dependency":
+            if environment_failure(bench) or bench.get("failure_kind") == "missing_dependency":
                 preflight["status"] = "infrastructure_error"
                 dump(ref / "preflight.json", preflight)
                 raise InfrastructureError(
@@ -767,7 +798,10 @@ class Evaluator:
             try:
                 limit = self.cfg.get("case_storage_limit_bytes", 8 * 1024**3)
                 with checked_output(path, limit) as source:
-                    return torch.load(source, weights_only=True, mmap=True)
+                    record = torch.load(source, weights_only=True, mmap=True)
+                    if role == "reference" and not finite_reference(record["output"]):
+                        raise ValueError("reference output contains NaN/Inf")
+                    return record
             except Exception as error:
                 read_errors[role].append(str(error))
                 return None
@@ -949,10 +983,12 @@ class Evaluator:
         try:
             with self.gpu_operation(exclusive=False):
                 checked = self._check_candidate(task, snap, build, ev, result, final, attempt)
-        except _ReferenceStreamFailure:
+        except _ReferenceStreamFailure as error:
             if attempt == 0:
                 return self.evaluate(task, snap, final, attempt=1, measure=measure)
-            raise InfrastructureError("reference stream failed twice; do not assign model reward")
+            raise ReferenceTaskError(
+                "reference stream failed twice; do not assign model reward", error.detail_path,
+            ) from error
         except OSError as error:
             # 通道空间预留失败不能解释成 CUDA 数学错误，也不能给占位奖励。
             set_reward(result, None, stage="environment", failure_kind="environment",
@@ -978,10 +1014,19 @@ class Evaluator:
         phase = "hidden" if final else "feedback"
         # 两端分别执行，宿主逐例核对输出；ran 是候选 worker 最终返回的状态。
         checks, reference, ran = self.streamed_checks(task, snap, build, ev, phase)
+        # 任一端 OOM/异常退出/实际空间不足优先停止，不能被参考补采分支掩盖。
+        if environment_failure(reference) or environment_failure(ran):
+            result.update(status="infrastructure_error", execution=ran, reference_execution=reference)
+            set_reward(result, None, stage="environment", failure_kind="environment",
+                       reason="stream_environment_failure", valid=False)
+            dump(ev / "result.json", result)
+            raise InfrastructureError(f"stream environment failed; see {ev / 'result.json'}")
         reference_waited_for_candidate = False
         if reference["status"] == "timeout" and ran["status"] != "ok":
             # 配对握手会让正常参考等待慢/挂起的候选；不能仅凭同时超时就归咎于参考。
             health = self.reference_health(task, ev, phase)
+            if environment_failure(health):
+                raise InfrastructureError(f"reference health environment failed; see {ev / 'reference-health/result.json'}")
             result["stream_failure"] = {
                 "reference": reference, "candidate": ran,
                 "reference_health": health,
@@ -1001,7 +1046,7 @@ class Evaluator:
                        reason="reference_stream_failed", valid=False)
             dump(ev / "result.json", result)
             # 由 evaluate 在释放当前租约后完整重试，保持原来的测时/隐藏标记。
-            raise _ReferenceStreamFailure("reference stream failed")
+            raise _ReferenceStreamFailure("reference stream failed", ev / "infrastructure-error.json")
         if environment_failure(ran):
             result.update(status="infrastructure_error", execution=ran, checks=checks)
             set_reward(result, None, stage="environment", failure_kind="environment",
@@ -1091,7 +1136,15 @@ class Evaluator:
             timeout=300,
         )
         result["baseline_after"] = after
-        if after["status"] != "ok" or after.get("state_mutations"):
+        if environment_failure(after):
+            dump(ev / "infrastructure-error.json", {"after": after})
+            raise InfrastructureError(f"reference timing environment failed; see {ev / 'baseline-after/bench_result.json'}")
+        baseline_times = [after.get(mode, {}).get("cuda_ms") for mode in ("eager", "compile")]
+        baseline_valid = all(
+            isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+            for value in baseline_times
+        )
+        if after["status"] != "ok" or after.get("state_mutations") or not baseline_valid:
             result.update(status="infrastructure_error", timing_valid=False)
             set_reward(result, None, stage="environment", failure_kind="environment",
                        reason="reference_timing_failed", valid=False)
@@ -1099,10 +1152,10 @@ class Evaluator:
             dump(ev / "infrastructure-error.json", {"after": after})
             # 参考执行故障仍可有限重试同一源码；这与已取消的漂移重试不同。
             if attempt == 0:
-                retried = self.evaluate(task, snap, final, attempt=1)
+                retried = self.evaluate(task, snap, final, attempt=1, measure=measure)
                 retried["retry_of"] = ev.name
                 return retried
-            raise InfrastructureError("reference timing failed twice; no model reward")
+            raise ReferenceTaskError("reference timing failed twice; no model reward", ev / "baseline-after/bench_result.json")
 
         times = [measured["timing"]["cuda_ms"], after["eager"]["cuda_ms"], after["compile"]["cuda_ms"]]
         if any(

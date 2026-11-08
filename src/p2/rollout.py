@@ -6,6 +6,9 @@
 总上下文上限由原生 vLLM 服务依据 max_model_len 控制，不自行重写生成过程。
 """
 
+import json
+
+from p2.failures import RecoverableSampleError, check_quarantine, record_failure
 from verl.experimental.agent_loop.agent_loop import register
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 
@@ -16,12 +19,25 @@ class CudaSingleTurnLoop(SingleTurnAgentLoop):
 
     async def run(self, sampling_params, priority=0, **kwargs):
         """输入采样参数和 raw_prompt；固定请求 seed 后返回原生结果，不另存 token 审计。"""
-        params = dict(sampling_params, seed=int(self.config.p2.seed))
-        output = await super().run(params, priority=int(priority), **kwargs)
+        # UID 来自 verl 原始请求；用于精确关联失败组，避免扫描旧日志误判。
+        extra = kwargs["extra_info"]
+        task = json.loads(extra["task_json"])
+        try:
+            check_quarantine(self.config.p2, task["task_id"])
+            params = dict(sampling_params, seed=int(self.config.p2.seed))
+            output = await super().run(params, priority=int(priority), **kwargs)
+            if not output.response_ids:
+                raise RecoverableSampleError("rollout 真正返回零 token，丢弃并补采")
+        except Exception as error:
+            record_failure(
+                self.config.p2, kwargs["uid"], task["task_id"], error,
+                hidden=bool(extra.get("hidden", False)),
+            )
+            raise
         # 不对回答重新编码，直接核对原生流程返回的真实 token、mask 和概率长度。
         size = len(output.response_ids)
-        if not size or len(output.prompt_ids) + size > int(self.config.p2.context_tokens):
-            raise ValueError("rollout 返回空输出或超出总上下文预算")
+        if len(output.prompt_ids) + size > int(self.config.p2.context_tokens):
+            raise ValueError("rollout 超出总上下文预算")
         if len(output.response_mask) != size:
             raise ValueError("rollout response mask 与实际 response token 不对应")
         if output.response_logprobs is None or len(output.response_logprobs) != size:
