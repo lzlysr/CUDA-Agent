@@ -462,63 +462,70 @@ def compile_candidate():
     return {"compiled": True}
 
 
-# model 是待测模型，samples 是 GPU 输入列表，cfg 提供轮数和每轮迭代数。
-# 返回 cuda_ms、wall_ms 和逐轮结果；计时单位为毫秒，预热和输入复制在测量区间外。
-def timing(model, samples, cfg):
-    """输入可调用模型、多组 GPU 输入和配置；预热并重复同步测量，返回 CUDA/墙钟中位数。"""
-    # 先让每一组输入各执行一次，完成首次调用和相关运行准备。
-    for x in samples:
-        call(model, tree(x, lambda t: t.clone()))
-    # 等待预热及此前 CUDA 工作全部结束。
+# model 是待测模型，sample 是当前唯一一组原始 GPU 输入。
+# iterations 是本组在每轮中分摊的测量次数；输入复制始终在计时区间之外。
+def timing(model, sample, cfg, iterations):
+    """输入模型、单组输入、配置和次数；返回每轮的原始 CUDA/墙钟时间列表。
+
+    每次调用都使用新的克隆，避免原地计算污染同组的后续测量和另一条基线。
+    返回原始时间供所有输入组共同汇总，不能先取各组中位数再取中位数。
+    """
+    # 预热副本与计时副本都只保留到本次调用结束，不随输入组数累积。
+    warmup_inputs = tree(sample, lambda tensor: tensor.clone())
+    call(model, warmup_inputs)
     SYNC()
-    # 保存各轮的代表耗时，最后再跨轮取中位数。
+    del warmup_inputs
     rounds = []
     for _ in range(cfg["timing_rounds"]):
-        # 本轮每次迭代的 CUDA Event 耗时列表。
-        events = []
-        # 本轮每次迭代的宿主墙钟耗时列表。
-        walls = []
-        for i in range(cfg["timing_iterations"]):
-            x = tree(samples[i % len(samples)], lambda t: t.clone())
-            # 在计时开始前等待输入复制及已有 GPU 工作结束。
+        events, walls = [], []
+        for _ in range(iterations):
+            # 重置输入内容并等待复制完成；复制开销不计入 GPU Event 或墙钟测时。
+            inputs = tree(sample, lambda tensor: tensor.clone())
             SYNC()
-            # 创建开始/结束事件，并启用 GPU 时间统计。
-            a, b = EVENT(enable_timing=True), EVENT(enable_timing=True)
-            t = CLOCK()
-            # 在当前 CUDA 流记录开始事件。
-            a.record()
-            # 执行一次模型调用；这是本次测量的主体。
-            out = call(model, x)
-            # 在当前 CUDA 流记录结束事件。
-            b.record()
-            # 等待 GPU 工作完成，使墙钟和事件时间都可读取完整结果。
+            start, end = EVENT(enable_timing=True), EVENT(enable_timing=True)
+            started = CLOCK()
+            start.record()
+            output = call(model, inputs)
+            end.record()
             SYNC()
-            walls.append((CLOCK() - t) * 1e3)
-            events.append(a.elapsed_time(b))
-            # 测量完成后释放输出引用，不把输出销毁放在本次计时区间内。
-            del out
-        rounds.append({"cuda_ms": statistics.median(events), "wall_ms": statistics.median(walls)})
+            walls.append((CLOCK() - started) * 1e3)
+            events.append(start.elapsed_time(end))
+            # 必须在下一次 clone 前释放，否则赋值右侧计算期间会同时保留两个副本。
+            del output, inputs
+        rounds.append({"cuda_ms": events, "wall_ms": walls})
+    return rounds
+
+
+def summarize_timing(rounds):
+    """输入合并所有输入组后的逐轮原始时间；返回兼容现有结果格式的中位数统计。"""
+    # 先在每轮全部测量中取中位数，再跨轮取中位数，保持原先的聚合规则。
+    medians = [
+        {key: statistics.median(row[key]) for key in ("cuda_ms", "wall_ms")}
+        for row in rounds
+    ]
     return {
-        # 各轮 CUDA 代表耗时的中位数，用于控制器计算加速比。
-        "cuda_ms": statistics.median(x["cuda_ms"] for x in rounds),
-        # 各轮墙钟代表耗时的中位数，与 CUDA 时间分别报告。
-        "wall_ms": statistics.median(x["wall_ms"] for x in rounds),
-        "rounds": rounds,
+        "cuda_ms": statistics.median(row["cuda_ms"] for row in medians),
+        "wall_ms": statistics.median(row["wall_ms"] for row in medians),
+        "rounds": medians,
     }
 
 
 # 输入模型和一组 GPU 样本；返回按设备耗时排序的摘要，以及完整事件名列表。
 def profile_model(model, sample):
     """输入可调用模型及一组 GPU 输入；返回算子统计与全部事件名，不参与计时。"""
+    # 在 profiler 外准备副本，避免输入原地修改污染当前组，复制不进入算子审计。
+    inputs = tree(sample, lambda tensor: tensor.clone())
+    SYNC()
     # 启用 profiler 执行单次模型调用；采样独立于上方 timing，不混入性能计时。
     with torch.profiler.profile(
         # 同时记录 CPU 与 CUDA 活动，便于识别运算调用及其设备开销。
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     ) as profiler:
         # 执行传入样本，不在此处计算输出正确性。
-        call(model, sample)
+        output = call(model, inputs)
         # 等待 CUDA 工作完成，让 profiler 捕获该次调用产生的设备活动。
         SYNC()
+    del output, inputs
     # 按事件键聚合采样结果，取得每类事件的调用次数与累计耗时。
     events = list(profiler.key_averages())
     # 构建可序列化的事件摘要。
@@ -609,60 +616,69 @@ class FallbackGuard(TorchDispatchMode):
 
 # cfg 提供计时与容差配置，candidate 决定测原始模型还是候选；返回测时和审计字典。
 def bench(cfg, candidate=False):
-    """输入配置和是否候选；返回 eager/compile 或候选耗时、profile、精度状态和运行期回退。"""
-    # 始终从可信输入定义生成样本，即使测候选也不使用候选自定义的输入生成器。
+    """逐组重建可信输入，测量所有目标后释放；返回原有性能、profile 和状态字段。
+
+    五组输入不再同时驻留 GPU；eager/compile 共享当前组的原始输入，各次调用用独立副本。
+    每轮仍总共执行 timing_iterations 次测量，按原来的 i % 组数分配到各组。
+    """
     inpmod = load("/inputs/model.py", "input_spec")
-    # 候选分支加载 ModelNew，参考分支加载原始 Model。
     if candidate:
-        # 把扩展构建目录和候选目录放到导入搜索路径前面，以便找到 cuda_extension。
+        # 候选仍使用可信输入定义和固定参数，只加载冻结的 ModelNew。
         sys.path[:0] = ["/build", "/candidate"]
-        # 动态加载冻结的候选 Python 入口文件。
         mod = load("/candidate/model_new.py", "candidate_model")
-        # 恢复反馈初始化种子 71001 对应的固定参数。
         model = load_model(mod, "ModelNew", 71001, inpmod)
+        models = {"timing": model}
     else:
-        # 参考分支用同一份固定参数恢复原始 Model。
         model = load_model(inpmod, "Model", 71001, inpmod)
-    # 性能测试统一使用 feedback 案例的输入种子，先生成全部 GPU 样本。
-    samples = [inputs_for(inpmod, c["input_seed"]) for c in case_list("feedback", cfg)]
-    # 在测时开始前记录两项 TF32 设置。
+        # compile 在第一组输入就绪后初始化，单列首次调用成本。
+        models = {"eager": model, "compile": None}
+    cases = case_list("feedback", cfg)
+    # 仅保留标量测时结果；这里不会保存任意组的 GPU 张量。
+    measurements = {
+        name: [{"cuda_ms": [], "wall_ms": []} for _ in range(cfg["timing_rounds"])]
+        for name in models
+    }
     before = flags()
-    result = {}
-    if candidate:
-        result["timing"] = timing(model, samples, cfg)
-        # 额外对第一组输入做 profiler 采样，取得展示摘要和完整事件名。
-        result["profile"], names = profile_model(model, samples[0])
-        # 把不允许的 ATen 事件列入 runtime_fallbacks，供宿主判断候选是否合规。
-        result["runtime_fallbacks"] = runtime_fallbacks(names)
-    else:
-        # 先测未经 torch.compile 包装的 PyTorch eager 模型。
-        result["eager"] = timing(model, samples, cfg)
-        # 另外统计本次创建编译包装器并完成首次调用的耗时。
-        started = CLOCK()
-        # 使用 torch.compile 的 default 模式包装原始模型。
-        compiled = torch.compile(model, mode="default")
-        call(compiled, samples[0])
-        SYNC()
-        # 首调成本单独以秒记录，不混入下面的稳态毫秒时间。
-        result["compile_first_call_seconds"] = CLOCK() - started
-        # 再通过相同 timing 流程测量编译模型的稳态性能。
-        result["compile"] = timing(compiled, samples, cfg)
-        # 与官方 profiling.py 一致：compile 在这里仅提供性能基线，不与 eager 比较输出。
-        # 候选正确性仍由独立的流式验算对照原始 eager 输出；不改变其容差或案例数。
-        result["profiles"] = {
-            "eager": profile_model(model, samples[0])[0],
-            "compile": profile_model(compiled, samples[0])[0],
-        }
-        # 在结果中明确记录这次编译基线使用的模式。
-        result["compile_mode"] = "default"
-    # 无论参考或候选，都附上运行前后的 TF32 设置及变更标记。
+    result = {} if candidate else {"profiles": {}, "compile_mode": "default"}
+    for index, case in enumerate(cases):
+        # 同一组只生成一次，供两个参考基线共用；上一组已在 finally 中释放。
+        sample = inputs_for(inpmod, case["input_seed"])
+        try:
+            # 例如每轮 10 次、5 组时，每组恰好 2 次；不能变成每组各测 10 次。
+            iterations = len(range(index, cfg["timing_iterations"], len(cases)))
+            for name in models:
+                if name == "compile" and models[name] is None:
+                    # 保护原始输入；准备副本和同步均放在编译首次调用计时之外。
+                    first_inputs = tree(sample, lambda tensor: tensor.clone())
+                    SYNC()
+                    started = CLOCK()
+                    models[name] = torch.compile(model, mode="default")
+                    first_output = call(models[name], first_inputs)
+                    SYNC()
+                    result["compile_first_call_seconds"] = CLOCK() - started
+                    del first_output, first_inputs
+                rows = timing(models[name], sample, cfg, iterations)
+                for total, current in zip(measurements[name], rows):
+                    total["cuda_ms"].extend(current["cuda_ms"])
+                    total["wall_ms"].extend(current["wall_ms"])
+                # 与旧实现相同，只对第一组做 profiler；不额外生成大输入。
+                if index == 0:
+                    profile, names = profile_model(models[name], sample)
+                    if candidate:
+                        result["profile"] = profile
+                        result["runtime_fallbacks"] = runtime_fallbacks(names)
+                    else:
+                        result["profiles"][name] = profile
+        finally:
+            # 及时解除当前组引用；缓存分配器可在下一组复用这些显存，无需清空整个缓存。
+            del sample
+    for name, rounds in measurements.items():
+        result[name] = summarize_timing(rounds)
     result.update(
         tf32_before=before,
         tf32_after=flags(),
-        # 前后必须都等于 [True, True]；否则记录精度标志发生变化。
         state_mutations=[] if before == flags() == [True, True] else ["precision flags changed"],
     )
-    # 把性能及状态交回 main，再由 main 补充成功状态和执行时长。
     return result
 
 

@@ -10,7 +10,7 @@ p2:
   # 评测卡和并发覆盖，正式计时仍独占。
   kernel_overrides:
     evaluation_gpu: [4, 3]
-    evaluation_concurrency: 4
+    evaluation_concurrency: 2
     # 单例输出/参数快照上限 16 GiB；双输出通道预留 32 GiB，实际空间不足仍停止。
     case_storage_limit_bytes: 17179869184
   # prompt+response 总上下文预算。
