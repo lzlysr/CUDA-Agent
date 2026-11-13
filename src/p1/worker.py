@@ -633,6 +633,11 @@ def bench(cfg, candidate=False):
         # compile 在第一组输入就绪后初始化，单列首次调用成本。
         models = {"eager": model, "compile": None}
     cases = case_list("feedback", cfg)
+    # P3 仅对一组输入重复测时；默认仍保留 P1/P2 原来的五组。正确性案例不受此参数影响。
+    count = cfg.get("timing_input_cases", len(cases))
+    if not 1 <= count <= len(cases):
+        raise ValueError("timing_input_cases must stay within feedback cases")
+    cases = cases[:count]
     # 仅保留标量测时结果；这里不会保存任意组的 GPU 张量。
     measurements = {
         name: [{"cuda_ms": [], "wall_ms": []} for _ in range(cfg["timing_rounds"])]
@@ -662,7 +667,7 @@ def bench(cfg, candidate=False):
                     total["cuda_ms"].extend(current["cuda_ms"])
                     total["wall_ms"].extend(current["wall_ms"])
                 # 与旧实现相同，只对第一组做 profiler；不额外生成大输入。
-                if index == 0:
+                if index == 0 and (candidate or cfg.get("reference_profile", True)):
                     profile, names = profile_model(models[name], sample)
                     if candidate:
                         result["profile"] = profile
@@ -898,6 +903,7 @@ def main():
             "reference_prepare": lambda: prepare(cfg),
             # reference_bench：测量原始模型 eager/compile 基线。
             "reference_bench": lambda: bench(cfg),
+            "reference_profile": lambda: bench(dict(cfg, reference_profile=True)),
             # candidate_bench：测量候选扩展模型，并收集运行期回退事件。
             "candidate_bench": lambda: bench(cfg, True),
             # reference_stream：参考端按指定阶段逐例发布输出。
@@ -936,6 +942,7 @@ def main():
     result_name = {
         "reference_prepare": "prepare_result.json",
         "reference_bench": "bench_result.json",
+        "reference_profile": "bench_result.json",
     }.get(a.mode, "result.json")
     (Path("/outputs") / result_name).write_text(json.dumps(result, indent=2))
     # 详情已在 JSON 中保存；终端只输出阶段摘要与错误，避免 worker.log 重复整份结果。

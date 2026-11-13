@@ -320,7 +320,7 @@ class Evaluator:
             (out, "/outputs", "rw"),
         ]
         # 参考性能测量专用缓存；同题各次原始性能分析和后测基线复用编译缓存。
-        if mode == "reference_bench" and reference is not None:
+        if mode in {"reference_bench", "reference_profile"} and reference is not None:
             cache = Path(reference) / "compile-cache"
             cache.mkdir(exist_ok=True)
             # 参考 bench 容器通过 /refcache 读写持久缓存。
@@ -372,10 +372,10 @@ class Evaluator:
             "XDG_CACHE_HOME": "/tmp/cache",
             # reference_bench 模式下使用可复用的 Inductor、Triton 缓存；其他模式使用本次输出下的独立缓存。
             "TORCHINDUCTOR_CACHE_DIR": (
-                "/refcache/inductor" if mode == "reference_bench" else "/outputs/inductor"
+                "/refcache/inductor" if mode in {"reference_bench", "reference_profile"} else "/outputs/inductor"
             ),
             "TRITON_CACHE_DIR": (
-                "/refcache/triton" if mode == "reference_bench" else "/outputs/triton"
+                "/refcache/triton" if mode in {"reference_bench", "reference_profile"} else "/outputs/triton"
             ),
             # 将 PyTorch C++/CUDA 扩展的构建根目录固定为 /build。
             "TORCH_EXTENSIONS_DIR": "/build",
@@ -413,6 +413,7 @@ class Evaluator:
         result_name = {
             "reference_prepare": "prepare_result.json",
             "reference_bench": "bench_result.json",
+            "reference_profile": "bench_result.json",
         }.get(mode, "result.json")
         result_path = out / result_name
         started = time.monotonic()
@@ -598,7 +599,7 @@ class Evaluator:
             if path.is_file()
         }
         # 静态审查只读取快照源码，返回明确违规 issues 和需要人工复核的 warnings。
-        audit = audit_contract(snap)
+        audit = audit_contract(snap, infer_calls=self.cfg.get("static_call_inference", True))
         # 两份绑定文件是可信固定基础设施，不能让候选自由修改或省略。
         for name in ["binding.cpp", "binding_registry.h"]:
             # 以已经下载的官方 agent_workdir 文件为逐字节比较基准。
@@ -1152,7 +1153,8 @@ class Evaluator:
             dump(ev / "infrastructure-error.json", {"after": after})
             # 参考执行故障仍可有限重试同一源码；这与已取消的漂移重试不同。
             if attempt == 0:
-                retried = self.evaluate(task, snap, final, attempt=1, measure=measure)
+                # 进入本方法即表示请求正式测时；measure 不是本方法的局部变量。
+                retried = self.evaluate(task, snap, final, attempt=1, measure=True)
                 retried["retry_of"] = ev.name
                 return retried
             raise ReferenceTaskError("reference timing failed twice; no model reward", ev / "baseline-after/bench_result.json")

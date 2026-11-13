@@ -29,7 +29,7 @@ CPP_TYPES = {
 }
 
 
-def audit_contract(directory):
+def audit_contract(directory, *, infer_calls=True):
     """输入候选目录；返回 {issues: 明确违规列表, warnings: 人工复核提示列表}。
 
     沿 forward→self.helper/模块函数追踪调用；只导入 F 不视为执行回退。
@@ -157,7 +157,11 @@ def audit_contract(directory):
                     or (isinstance(call.func, ast.Attribute) and call.func.attr in METADATA)
                 )
                 if not permitted:
-                    issues.append("forward computation outside extension: " + name)
+                    # 已知 torch 调用仍明确拒绝；未知对象/张量方法由真实执行 guard 判断，不能仅按名字推断。
+                    if infer_calls or name.startswith("torch."):
+                        issues.append("forward computation outside extension: " + name)
+                    else:
+                        warnings.append("runtime audit required for call: " + name)
 
         check_function(methods["forward"], set())
 

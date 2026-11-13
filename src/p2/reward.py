@@ -27,7 +27,7 @@ class P2Evaluator(ParallelEvaluator):
         OOM、异常退出、缺依赖、空间不足立即停止；数值不稳定/非有限立即隔离。
         """
         retryable_stage = mode == "reference_prepare" or (
-            mode == "reference_bench" and Path(out).name == "initial-bench"
+            mode in {"reference_bench", "reference_profile"} and Path(out).name == "initial-bench"
         )
         for attempt in range(2 if retryable_stage else 1):
             result = super().container(mode, out, **kwargs)
