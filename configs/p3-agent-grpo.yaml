@@ -1,0 +1,185 @@
+# P3 唯一手工配置；本次仅补注释，不改参数值。
+# 运行：bash scripts/p3-train.sh --run runs/p3/agent-grpo
+
+p3:  # 本地 CUDA 环境、GPU 分工及轨迹预算；其余训练项使用 verl 原生字段
+  training_gpus: [2, 5]  
+  context_tokens: 131072  # 单轨迹总上下文上限，含系统提示、模型生成和工具观察
+  training_turns: 150
+  validation_turns: 200
+  tools: [Bash, BashOutput, KillBash, Read, Write, Edit, MultiEdit, Glob, Grep, TodoWrite, profile_reference, evaluate, submit]
+  kernel:  # 复用 P1/P2 评测器的 CUDA 环境参数
+    seed: 42
+    evaluation_gpu: [4, 3]
+    evaluation_concurrency: 4  # 每张评测卡最多4个非独占 GPU 作业；正式测时仍独占
+    docker_image: "sha256:d58d23b33e24c351dffc6b1bda93dcd7925e3832e2770da6b65e10abfdd05fa0"
+    compile_seconds: 300
+    evaluation_seconds: 120
+    shell_seconds: 600
+    compile_workers: 4
+    atol: 0.01
+    rtol: 0.01
+    feedback_cases: 5  # 每候选五组正确性输入
+    timing_input_cases: 1  # 正式测时使用反馈输入中的第一组
+    timing_rounds: 1  # 正式计时轮数
+    timing_iterations: 10  # 每轮重复执行10次后汇总耗时
+    reference_profile: false
+    static_call_inference: false
+    case_storage_limit_bytes: 17179869184
+    hidden_init_seeds: []  # 不准备隐藏输入
+    hidden_cases_per_init: 0  # 不执行隐藏验收
+    protocol_version: p3-agent-grpo
+
+data:  # verl 原生数据集与 DataLoader 设置
+  train_files: [data/processed/train.jsonl]
+  val_files: [data/processed/test.jsonl]
+  custom_cls:
+    path: "${p3.root}/src/p3/data.py"
+    name: AgentDataset
+  train_batch_size: 4  # 每个训练 step 的题目数4；乘 rollout.n=4 后为16条训练轨迹
+  val_batch_size: 24
+  train_max_samples: -1
+  val_max_samples: 24
+  seed: 42
+  shuffle: true
+  validation_shuffle: false
+  dataloader_num_workers: 0  # 0表示在 Trainer 主进程取数据，不派生 DataLoader 子进程；不限制 GPU 并发
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 1
+  max_prompt_length: 131071
+  max_response_length: "${p3.context_tokens}"
+  truncation: error  # 初始提示超预算时报错/过滤，不静默裁掉原题代码
+  return_multi_modal_inputs: false
+  tool_config_path: "${p3.run}/config.yaml"
+
+actor_rollout_ref:  # Actor、rollout 引擎及冻结参考策略的原生配置
+  model:
+    _target_: p3.models.TextModelConfig
+    path: models/Qwen3.5-9B
+    external_lib: p3.models
+    override_config:
+      attn_implementation: flash_attention_2
+      use_cache: false
+    use_remove_padding: true  # 在模型前向计算前去掉补齐长度的 PAD token，减少无效计算和激活显存。
+    enable_gradient_checkpointing: true  # 反向时重算部分前向激活，省显存但增加计算
+    enable_activation_offload: true  # 使用框架原生激活卸载，降低长上下文显存峰值；容量仍需实测
+    use_fused_kernels: true  # 使用 verl 原生融合/分块输出头，避免一次保留完整词表 logits
+    fused_kernel_options:
+      impl_backend: torch
+    lora_rank: 64
+    lora_alpha: 128
+    target_modules: all-linear
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 4  # 以题目为单位的优化 minibatch4；乘 n=4 后每次更新用16条轨迹
+    ppo_micro_batch_size_per_gpu: 1  # 每张训练卡每次前反向处理1条轨迹；通过梯度累积凑有效 minibatch
+    ppo_epochs: 1  # 每批 rollout 数据只做一遍策略更新；当前恰好一个有效 minibatch
+    use_torch_compile: false
+    clip_ratio: 0.2
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    loss_agg_mode: seq-mean-token-mean
+    optim:
+      lr: 3e-6
+    entropy_coeff: 0.0  # 熵奖励权重为0，不额外鼓励分布变平；不等于采样温度为0
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    freeze_vision_tower: true
+    fsdp_config:
+      strategy: fsdp2
+      model_dtype: bf16
+      param_offload: true
+      optimizer_offload: true
+      use_torch_compile: false
+      seed: "${data.seed}"
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1  # 冻结参考策略每卡概率重算的微批量为1；LoRA 参考策略由原生禁用适配器实现
+  rollout:
+    name: vllm
+    dtype: bfloat16
+    tensor_model_parallel_size: "${p3.training_gpu_count}"
+    gpu_memory_utilization: 0.45
+    enforce_eager: true
+    enable_chunked_prefill: true  # 分块处理长 prompt 的 prefill，减小瞬时调度压力
+    enable_prefix_caching: true  # 复用相同前缀的推理 KV；不会缓存候选 CUDA 算子的答案
+    max_model_len: "${p3.context_tokens}"
+    max_num_batched_tokens: 32768
+    max_num_seqs: 16
+    load_format: safetensors
+    calculate_log_probs: true  # 保留生成 token 的 rollout 概率供原生策略更新使用
+    logprobs_mode: raw_logprobs  # 记录原始 logits 对应的 logprob，不采用截断采样后重新归一化的 logprob
+    n: 4
+    seed: "${data.seed}"
+    temperature: 0.6
+    top_p: 0.95
+    top_k: 20
+    log_prob_micro_batch_size_per_gpu: 1  # 旧策略概率重算的每卡微批量为1
+    engine_kwargs:
+      vllm:
+        enable_tower_connector_lora: true
+    agent:
+      num_workers: 4
+      default_agent_loop: cuda_grpo
+    multi_turn:
+      enable: true
+      format: qwen3_coder
+      max_assistant_turns: "${p3.training_turns}"
+      max_parallel_calls: 16
+      max_tool_response_length: 8192
+      tool_response_truncate_side: middle
+      tool_config_path: "${p3.run}/config.yaml"
+    val_kwargs:
+      n: 1  # 验证每道题生成一条轨迹，不构造 GRPO 更新组
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+      do_sample: true
+
+critic:
+  enable: false
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  filter_groups:  # 原生 DAPO 同分组动态过滤开关
+    enable: false  # 不因组内同分而重采；只对参考无效等明确环境样本失败补采
+reward:  # 框架独立奖励 worker 配置；本项目在 Agent 内完成可信评分
+  num_workers: 0  # 零个独立奖励 worker；每条 Agent 已附上可信终局 reward_score
+transfer_queue:
+  enable: true
+  backend:
+    SimpleStorage:
+      num_data_storage_units: 2
+      total_storage_size: 128
+trainer:
+  n_gpus_per_node: "${p3.training_gpu_count}"
+  logger: [console, tensorboard]
+  project_name: CUDA-Agent-P3
+  experiment_name: "${p3.run_name}"
+  total_epochs: 1000
+  total_training_steps: 150
+  default_local_dir: "${p3.run}/checkpoints"
+  resume_mode: disable
+  save_freq: 30
+  test_freq: 5
+  val_before_train: true  # 更新前先验证，提供同协议下的训练前参照
+  max_actor_ckpt_to_keep: null
+  v1:
+    trainer_mode: sync
+    sampler:
+      max_off_policy_threshold: 1
+      sync_refill_failed_groups: true
+      sampler_kwargs:
+        run: "${p3.run}"
+        group_size: "${actor_rollout_ref.rollout.n}"  # 期望同题轨迹数，必须等于 rollout.n
+        train_batch_size: "${data.train_batch_size}"
+        max_resample_factor: 4  # 每批最多丢弃4×train_batch_size个无效组，超限停止；不是同分组过滤
+      custom_sampler:
+        path: "${p3.root}/src/p3/training.py"
+        name: GroupReplayBuffer
+ray_kwargs:
+  ray_init:
+    num_cpus: 24
+    num_gpus: "${p3.training_gpu_count}"
+    include_dashboard: false
+    _temp_dir: "${p3.ray_temp}"
