@@ -1,16 +1,18 @@
-# P3 唯一手工配置；本次仅补注释，不改参数值。
+# P3 唯一手工配置
 # 运行：bash scripts/p3-train.sh --run runs/p3/agent-grpo
 
 p3:  # 本地 CUDA 环境、GPU 分工及轨迹预算；其余训练项使用 verl 原生字段
-  training_gpus: [2, 5]  
-  context_tokens: 131072  # 单轨迹总上下文上限，含系统提示、模型生成和工具观察
-  training_turns: 150
-  validation_turns: 200
+  training_gpus: [0, 2]  
+  context_tokens: 32768  # 单轨迹总上下文32K，包含提示、模型输出和工具观察 # 131072
+  training_turns: 30  # 训练最多30轮，限制反复修改候选的成本 # 150
+  validation_turns: 30  # 验证使用相同轮数，避免单题长时间试错 # 200
   tools: [Bash, BashOutput, KillBash, Read, Write, Edit, MultiEdit, Glob, Grep, TodoWrite, profile_reference, evaluate, submit]
   kernel:  # 复用 P1/P2 评测器的 CUDA 环境参数
     seed: 42
-    evaluation_gpu: [4, 3]
-    evaluation_concurrency: 4  # 每张评测卡最多4个非独占 GPU 作业；正式测时仍独占
+    evaluation_gpu: [6, 7]
+    evaluation_concurrency: 4  # 每卡最多4个共享作业；满额仍需排队，不无限增加显存压力
+    timing_exclusive: false  # 初始性能分析及候选/后测基线共享槽位，优先速度，允许测时噪声
+    fail_fast: true  # 首个明确失败就停止剩余验算；通过仍要求五组全部正确
     docker_image: "sha256:d58d23b33e24c351dffc6b1bda93dcd7925e3832e2770da6b65e10abfdd05fa0"
     compile_seconds: 300
     evaluation_seconds: 120
@@ -45,7 +47,7 @@ data:  # verl 原生数据集与 DataLoader 设置
   dataloader_num_workers: 0  # 0表示在 Trainer 主进程取数据，不派生 DataLoader 子进程；不限制 GPU 并发
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 1
-  max_prompt_length: 131071
+  max_prompt_length: 32767  # 启动入口随context_tokens推导为总上限减1；支持CLI显式覆盖
   max_response_length: "${p3.context_tokens}"
   truncation: error  # 初始提示超预算时报错/过滤，不静默裁掉原题代码
   return_multi_modal_inputs: false
@@ -105,6 +107,7 @@ actor_rollout_ref:  # Actor、rollout 引擎及冻结参考策略的原生配置
     max_model_len: "${p3.context_tokens}"
     max_num_batched_tokens: 32768
     max_num_seqs: 16
+    disable_log_stats: false  # 开启vLLM原生周期吞吐日志：prompt/generation token/s、请求队列及KV占用
     load_format: safetensors
     calculate_log_probs: true  # 保留生成 token 的 rollout 概率供原生策略更新使用
     logprobs_mode: raw_logprobs  # 记录原始 logits 对应的 logprob，不采用截断采样后重新归一化的 logprob
@@ -179,6 +182,9 @@ trainer:
         name: GroupReplayBuffer
 ray_kwargs:
   ray_init:
+    runtime_env:
+      env_vars:
+        VLLM_LOGGING_LEVEL: INFO  # 显式覆盖框架/外部环境的日志级别，使吞吐INFO日志可见
     num_cpus: 24
     num_gpus: "${p3.training_gpu_count}"
     include_dashboard: false

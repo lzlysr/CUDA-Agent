@@ -27,6 +27,9 @@ def compose(args, overrides):
         config = hydra.compose(config_name='ppo_trainer')
     OmegaConf.set_struct(config, False)
     config = OmegaConf.merge(config, OmegaConf.load(ROOT / args.config), OmegaConf.from_dotlist(overrides))
+    # 原生字段由唯一总上下文推导；显式CLI覆盖仍可保留，避免另加表达式解析器。
+    if not any(item.startswith('data.max_prompt_length=') for item in overrides):
+        config.data.max_prompt_length = int(config.p3.context_tokens) - 1
     run = (ROOT / args.run).resolve()
     config.p3.update(
         root=str(ROOT), run=str(run), run_name=run.name,
@@ -43,7 +46,7 @@ def compose(args, overrides):
     if args.steps is not None:
         config.trainer.total_training_steps = args.steps
     if args.wire:
-        # 仅限制接线样本/回答预算，不悄悄修改正式 YAML 的 128K 总上下文。
+        # 仅限制接线样本/回答预算，不改正式 YAML 的总上下文。
         config.data.train_batch_size = 2
         config.actor_rollout_ref.actor.ppo_mini_batch_size = 2
         config.actor_rollout_ref.rollout.n = 2
@@ -60,6 +63,7 @@ def compose(args, overrides):
     config.tools = []
     descriptions = {
         'Bash': 'Run CPU commands in the persistent shell. GPU jobs use the supplied utils commands. Query a running bash_id with BashOutput.',
+        'evaluate': 'Compile, verify all five inputs, and benchmark the candidate in one call. A separate compile call is unnecessary.',
         'submit': 'Finish this trajectory. Its fastest correct measured candidate receives the terminal reward.',
     }
     for name in config.p3.tools:

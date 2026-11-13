@@ -14,6 +14,7 @@ import threading
 from p1.evaluation import InfrastructureError, ReferenceTaskError, dump
 from p1.helper.baseline_state import beijing_now, cleanup_reference_artifacts
 from p1.helper.pilot_parallel import EvaluationPool
+from p1.helper.build_cache import build_identity, cache_lock
 from p1.run import Pilot
 from p1.sandbox import SandboxSession
 from p1.tools import WorkspaceTools
@@ -26,6 +27,10 @@ from .data import ROOT
 class KernelEvaluator(P2Evaluator):
     """复用现有参考有限重试；每条轨迹只准备一次，不自动增加初始基线测量。"""
 
+    def gpu_operation(self, exclusive=True):
+        """输入阶段的独占要求；P3 可配置共享测时，P1/P2 默认调度不受影响。"""
+        return self.operation(exclusive=exclusive and self.cfg.get('timing_exclusive', True))
+
     def prepare(self, task):
         """输入原题；只准备可信参数，参考性能由显式分析工具或后测基线计算。"""
         ref = self.run / 'references' / task['task_id']
@@ -33,7 +38,7 @@ class KernelEvaluator(P2Evaluator):
         if not target.exists():
             ref.mkdir(parents=True, exist_ok=True)
             (ref / 'model.py').write_text(task['code'])
-            with self.operation():
+            with self.operation(exclusive=False):
                 result = self.container('reference_prepare', ref / 'cases', reference=ref, timeout=300)
         else:
             result = json.loads(target.read_text())
@@ -42,12 +47,26 @@ class KernelEvaluator(P2Evaluator):
         return ref
 
     def profile_reference(self, task):
-        """输入原题；按需测一次原始 eager/compile 并提供 profile，可复用本轨迹结果。"""
+        """输入原题；同运行/环境/题目复用初始性能摘要，不缓存后测奖励或大张量。"""
+        # 身份覆盖源码、worker、依赖安装状态、镜像及数值/测时配置。
+        identity, _ = build_identity(ROOT, self.cfg, sha256(task['code'].encode()).hexdigest())
+        key = sha256(json.dumps([identity, self.cfg], sort_keys=True).encode()).hexdigest()
+        target = self.profile_cache / f'{key}.json'
+        with cache_lock(target.with_suffix('.lock')):
+            if target.exists():
+                return dict(json.loads(target.read_text()), reference_only=True,
+                            reference_profile_cache_hit=True, result_path=str(target))
+            result = self._profile_reference(task)
+            dump(target, result)
+            return dict(result, reference_profile_cache_hit=False, result_path=str(target))
+
+    def _profile_reference(self, task):
+        """输入未命中缓存的原题；共享槽位准备并分析 eager/compile，返回真实结果。"""
         ref = self.prepare(task)
         target = ref / 'initial-bench/bench_result.json'
         if target.exists():
             return json.loads(target.read_text())
-        with self.operation():
+        with self.gpu_operation(exclusive=True):
             result = self.container(
                 'reference_profile', ref / 'initial-bench', reference=ref,
                 inputs=ref / 'cases/input-spec', timeout=300,
@@ -80,6 +99,8 @@ class Workspace:
         pool = EvaluationPool(self.kernel['evaluation_gpu'], Path(config.p3.run) / 'scheduler', cfg=self.kernel)
         dump(self.directory / 'kernel/worker-config.json', self.kernel)
         self.evaluator = KernelEvaluator(self.kernel, self.directory / 'kernel', pool)
+        # 只共享小型初始分析摘要；输入/权重和参考编译缓存仍按轨迹结束及时清理。
+        self.evaluator.profile_cache = Path(config.p3.run) / 'scheduler/reference-profiles'
         self.session = None
         self.fatal = None
         self.submitted = False
@@ -140,7 +161,7 @@ class Workspace:
             snap = ev / 'candidate'
             cache_key = previous['compilation']['cache_key']
             build = ROOT / '.runtime/cache/p1-builds' / cache_key / 'build'
-            with self.evaluator.operation():
+            with self.evaluator.gpu_operation(exclusive=True):
                 result = self.evaluator._measure_candidate(self.task, snap, build, ev, dict(previous), False, 0)
         else:
             result = self.evaluator.evaluate(self.task, self.work, measure=measure)

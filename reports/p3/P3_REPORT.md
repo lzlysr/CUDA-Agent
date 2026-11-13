@@ -1,6 +1,6 @@
 # P3：直接 Agent + GRPO
 
-更新时间：2026-11-12，北京时间。
+更新时间：2026-11-13，北京时间。
 
 ## 1. 训练入口
 
@@ -32,7 +32,7 @@ bash scripts/p3-train.sh --run runs/p3/wire --wire
 
 以下分别以**论文正文/附录**、**当前本地官方仓库**和**当前 P3 配置/实现**为依据。
 论文未披露的参数明确标为“未披露”，不把框架默认值或本地经验值当成论文原值。
-本次仅改报告与 YAML 注释，**所有参数值均保持原样，包括尚未对齐的 clip_ratio_high=0.2**。
+当前按吞吐优先采用32K上下文、训练/验证各30轮及共享测时；这些预算与论文不同。clip_ratio_high仍为0.2。
 
 原始论文依据：PDF 第5–6页 §3.2，第7页 §3.3 式(3)–(5)，第8页 §4.1，
 第14–15页附录 B.1，以及第15–22页附录 B.2 的原始 SKILL。
@@ -77,16 +77,16 @@ bash scripts/p3-train.sh --run runs/p3/wire --wire
 
 | 项目/配置 | 论文原值或明确描述 | 当前 P3 值/实际行为 | 对齐判断及原因 |
 | --- | --- | --- | --- |
-| Agent 总上下文 | 131072 token；single阶段32768（§4.1） | 131072，含prompt、模型输出和工具观察 | Agent预算对齐；P3不运行single阶段 |
-| 训练/评测轮数 | 训练150 turns、评测200 turns（§4.1） | training_turns=150、validation_turns=200 | 对齐；上限不是保证每条都会用满 |
-| max_prompt_length/max_response_length | 未分别披露这两个框架字段 | 131071 / 131072；实际按prompt扣剩余量，总长度仍≤131072 | 本地长度接线，不能相加理解为256K |
+| Agent 总上下文 | 131072 token；single阶段32768（§4.1） | 32768，含prompt、模型输出和工具观察 | 按用户要求降低预算以限制成本，当前不对齐论文Agent的128K |
+| 训练/评测轮数 | 训练150 turns、评测200 turns（§4.1） | training_turns=30、validation_turns=30 | 按用户要求限制单题试错成本，不对齐论文原轮数 |
+| max_prompt_length/max_response_length | 未分别披露这两个框架字段 | 32767 / 32768；实际扣除prompt与工具观察，总长度≤32768 | 本地长度接线，不是64K；prompt上限随总上下文推导 |
 | temperature/top_p/top_k | 未披露 | 0.6 / 0.95 / 20；验证同样采样，n=1 | 当前Qwen采样方案，不是论文参数对齐 |
 | seed | 未披露具体值/每请求策略 | data/FSDP/vLLM全局42；移除每请求seed；反馈输入固定71001及72000–72004 | 全局42是用户要求；kernel.seed字段本身当前不被worker消费，见第9节 |
 | 工具观察长度 | 未披露精确截断阈值/方向 | 原生8192**字符**，middle截断 | 本地预算，不是8192 token，也不是论文原值 |
 | 单轮多工具 | 未披露精确并行调用数 | 初始max_parallel_calls=16；更多调用仍完整保留；同轨迹操作串行 | 保证记录/执行一致的本地接线，不代表16题并行评测 |
 | CPU/GPU 沙箱 | Docker CPU终端+独立GPU池（§4.1） | 持久CPU容器+可信控制器派发GPU容器 | 架构目标对齐；不直接执行官方同进程评测脚本 |
 | GPU 硬件/数量 | GPU验证及profiling池：128张H20；总训练GPU数未披露（§4.1） | A100，训练/rollout=[2,5]、评测=[4,3] | 硬件和规模不同；训练卡同步分阶段共享 |
-| 资源独占 | 论文描述GPU作业进程隔离、独占资源和有保证HBM（§4.1） | 每卡最多4个非测时作业；正式测时独占；外部用户进程不受本项目锁控制 | 并发验算是用户选择，**未完全对齐全作业独占/保证HBM** |
+| 资源独占 | 论文描述GPU作业进程隔离、独占资源和有保证HBM（§4.1） | 每卡最多4个共享作业，包括参考预检、初始分析、验算及候选/后测测时 | 用户接受吞吐优先与测时噪声；不对齐独占/保证HBM |
 | vLLM 调度 | 未披露 TP/KV显存比例/prefix caching等 | TP2、总显存45%预算、max_num_seqs16、分块prefill32768 | 本地推理容量设置，不是每卡同时训练16题 |
 | Agent worker | 未披露 Ray/Agent worker 数 | 4个CPU AgentLoop worker | 负责异步交互，不是额外4张训练卡 |
 | 超时/编译槽 | 未披露300/120/600秒或4槽限制 | 编译300秒、评测阶段120秒、前台Bash硬上限600秒、CPU编译槽4 | 本地资源控制；单轨迹不等于只允许运行120秒 |
@@ -107,7 +107,7 @@ bash scripts/p3-train.sh --run runs/p3/wire --wire
 | 候选/基线顺序 | 正文未明确；公开profiling.py实际先candidate再eager、compile | 候选后独立容器测eager/compile，并用该后测值打分 | 与公开示例的先后方向一致；PPO奖励内部顺序未公开，不能由示例推定 |
 | baseline取值/漂移 | 未披露本地漂移阈值或前后中位数机制 | 只用候选后基线，不因前后漂移拒绝 | 按用户此前确认的本地协议 |
 | 额外隐藏验收 | 论文无单列34次隐藏验收阶段 | hidden种子=[]、次数=0，训练/验证均不调用hidden阶段 | 去掉本项目原来的额外环节；五组验算仍在 |
-| 参考预检 | Ops-6K在数据合成阶段过滤不执行/随机/近常数题；未披露当前重复预检机制 | 每轨迹一次参考准备，检查重复输出容差、非有限等；不因近常数拒绝 | 本地环境适配；不是重新去污染，也不能说论文要求每轨迹重复检查 |
+| 参考预检 | Ops-6K在数据合成阶段过滤不执行/随机/近常数题；未披露当前重复预检机制 | 每轨迹按需准备参考参数；初始性能摘要按同运行/题目/环境复用；不因近常数拒绝 | 本地环境适配；不是重新去污染，也不能说论文要求每轨迹重复检查 |
 | 参考/候选隔离 | 保护验证脚本、GPU沙箱（§3.2/4.1） | 只读文件、可信输入/参数、独立参考/候选容器 | 目标对齐，隔离实现为本地工程 |
 | PyTorch回退 | 论文运行期禁止functional回退；SKILL更严格限制torch计算 | 静态明确违规+运行期dispatch/profiler审查，未知helper不凭名字误拒 | 对齐反回退目标；当前允许表及检查范围不是官方代码逐行复制 |
 | TF32状态 | 原文未披露完整状态隔离实现；SKILL列混合精度优化建议 | 统一基线/候选精度条件并检测状态污染 | 防止已知基线污染的本地工程，不是论文明确参数 |
@@ -131,7 +131,7 @@ bash scripts/p3-train.sh --run runs/p3/wire --wire
 | Grep | 附录B.1：ripgrep、regex、类型/上下文 | 调用kernel Conda的rg，支持相应选项，限定工作区 | 功能对齐；包装方式本地实现 |
 | TodoWrite | §3.2列TodoWriteTool | 记录工作区todo JSON | 功能对应；具体schema/持久化格式未披露 |
 | **未提供NotebookEdit** | 附录B.1明确提供NotebookEdit | P1已有该实现，但P3 tools列表没有选入 | **工具全集未完全对齐**；CUDA源码任务通常不需要notebook，当前不影响已有`.py/.cu`工作流 |
-| profile_reference | §3.2“先分析原始性能”，文中称profile.py；公开仓库为utils/profiling.py | 新增显式包装：无候选也能测原始eager/compile；本轨迹缓存一次 | 对齐论文要求的能力；工具名称/schema为本地新增 |
+| profile_reference | §3.2“先分析原始性能”，文中称profile.py；公开仓库为utils/profiling.py | 新增显式包装：无候选也能分析eager/compile；同运行/题目/环境复用初始摘要 | 对齐论文要求的能力；工具名称/schema为本地新增 |
 | evaluate | 官方utils compile/verification/profiling分阶段命令 | 新增组合入口：冻结→编译→五组正确→测时→后测基线 | 组合包装为本地工程；阶段能力与官方工作流对应 |
 | submit | 论文未披露同名工具或结束schema | 结束轨迹；可信控制器选择历史最佳，不接受模型自报分数 | 本地结束协议 |
 | Bash中的utils.compile / compile.sh | 官方同名编译入口 | P1兼容客户端经RPC调用可信编译控制器；A100用sm80，官方SKILL示例sm90 | 编译能力对齐，执行位置/硬件/具体实现不同 |
@@ -141,7 +141,7 @@ bash scripts/p3-train.sh --run runs/p3/wire --wire
 
 训练 loss、GRPO 优势、优化器、Actor/rollout 权重同步、checkpoint、进度条和TensorBoard均使用
 verl 原生实现。P3扩展职责及必要性见第7节；没有改写 `third_party/verl` 或已安装包。
-128K是上限；短序列检查不等于已验证128K实占显存，真实GRPO更新的验证状态见第6节。
+当前32K是总上下文上限，不是单次回答预算；真实GRPO更新状态见第6节。
 
 ## 3. 从一道题到一次更新
 
@@ -156,6 +156,7 @@ verl 原生实现。P3扩展职责及必要性见第7节；没有改写 `third_p
    自报正确性、耗时或奖励。参考参数仅在本轨迹第一次需要时准备；原始性能分析按需调用一次。
 5. `evaluate` 冻结源码、审查、编译、五组验算，通过后正式测时并后测 eager/compile。
    未知 Python helper 名不再单靠静态推断误拒，实际执行回退检查、TF32 状态检查等仍保留。
+   P3首个明确失败就停止剩余案例；正确候选仍须五组全部通过。
 6. 相同源码直接复用结果；已经五组验算成功、尚未测时的快照可直接晋升测时。文件变化才重测。
    `submit` 或自然结束时检查最终文件是否出现新候选，然后选择历史最佳有效候选。
    无合格候选给 -1；最后一次修改失败不会覆盖之前的合格快照。
@@ -172,7 +173,8 @@ verl 原生实现。P3扩展职责及必要性见第7节；没有改写 `third_p
 - 参考输出无效、参考执行有限重试仍失败、真正零 token 等明确可恢复错误：训练整组丢弃并
   交给原生同步补采，绝不拿残缺组计算 GRPO。每批有限补采，连续无效不会无限循环。
 - 验证参考无效则跳过、不换题；单独记录 requested/valid/skipped，模型本身答错仍计入分母。
-- OOM、worker 异常退出、传输容量超限、磁盘空间不足及未分类程序异常停止整个运行并留证据。
+- 候选执行/测时进程的SIGILL、SIGABRT、SIGFPE、SIGSEGV属于候选失败，保留退出码并反馈模型。
+- OOM、可信参考/控制进程异常、容器启动失败、SIGKILL/SIGTERM、传输容量超限、磁盘空间不足及未分类程序异常仍停止并留证据。
   环境无效计时不会伪装成模型 -1。
 
 共享控制器 `_measure_candidate()` 重试分支未定义 `measure` 的问题已改为显式 `measure=True`。
@@ -231,10 +233,10 @@ runs/p3/<run>/
 - 上述为接线/协议验证，不是模型训练效果或完整 128K 容量测试。
 - 原生 Dataset 样本数控制、保留官方 SKILL、部分失败组整体剔除、致命故障停止的定向检查通过。
   证据：`.runtime/tmp/p3-final-20261112/validation.json`。
-- **真实 GRPO 更新尚未执行，当前阻塞为原训练卡资源不足。**
+- **以下为11月12日历史资源阻塞记录；11月13日实际运行已进入初始验证，随后候选崩溃导致停止，尚无GRPO更新。**
   2026-11-12 20:31:27 启动前复查，GPU 2/5 空闲分别约 24.9/42.9 GiB。
   当前 `gpu_memory_utilization: 0.45` 对 80GiB 卡的初始预算约 36GiB，GPU 2 不满足。
-  没有换卡、终止其他进程、降低正式上下文或启动正式训练。
+  当时没有换卡、终止其他进程、降低正式上下文或启动正式训练。
   证据：`.runtime/tmp/p3-wire-launch-20261112/launch.json`。
   原卡资源满足后，应先自行执行 `--wire`，确认真实梯度更新和 LoRA 权重同步；
   当前不能把配置/协议通过说成完整训练已验通。
@@ -247,7 +249,7 @@ runs/p3/<run>/
 | 本地部分 | 原生框架负责什么 | 本地实际补什么 | 是否必须保留 |
 | --- | --- | --- | --- |
 | agent.py / WorkspaceTool | ToolAgentLoop生成状态机、工具解析、token连续拼接、观察mask、logprob | 把工具调用交给真实工作区；终局获得可信reward_score；生命周期/日志/致命错误传播 | **领域接线必须有**，可换文件组织；只配置tools名字不会自动创建本项目环境 |
-| agent.py / 少量状态钩子 | 原生回合处理 | 总上下文剩余额度、训练150/验证200轮、submit停止、移除每请求seed、保留全部同轮调用 | 用户要求下的薄接线；没有另写生成/优势/反传算法 |
+| agent.py / 少量状态钩子 | 原生回合处理 | 总上下文剩余额度、训练/验证各30轮、submit停止、移除每请求seed、保留全部同轮调用 | 用户要求下的薄接线；没有另写生成/优势/反传算法 |
 | models.py / TextModelConfig | HFModelConfig加载原始Qwen、tokenizer/processor；原生PEFT、FSDP、融合输出头 | super初始化后仅把processor=None；另导入agent以保证worker注册可见 | **当前Qwen3.5+V1/TQ纯文本路径的兼容措施**；不是GRPO理论必需，不新增网络层/价值头 |
 | training.py / GroupReplayBuffer | 原生队列、同步采样、补采、训练批量物化 | 根据错误索引区分环境致命/可恢复；部分失败组也完整剔除；组大小校验；有限补采 | **保留当前失败语义时需要**；只打开原生sync_refill_failed_groups不足以保证部分失败组不被保留/补零 |
 | training.py / CoverageTrainer | 原生验证、指标计算及整个fit/update循环 | 无效参考验证题从期望分母排除；全无效不伪造准确率；记录valid/skipped | 验证跳过的分母修正是当前约定所需；单独覆盖率JSON/显示属于可选观测工程 |
@@ -292,7 +294,7 @@ V1的`engine_workers.py`和FSDP `transformer_impl.py`没有读取/执行该字�
 | P1 | `src/p1/evaluation.py` | Evaluator、源码快照、编译/正确性/后测基线、reward、异常类型和dump | CUDA评测核心直接复用 |
 | P1 | `src/p1/worker.py` | Docker内实际reference_prepare、编译、五组stream、timing和profile；运行期回退/TF32检查 | 只执行当前P3派发的固定worker模式 |
 | P1 | `src/p1/contract.py` | 源码/导入/绑定/允许库静态审查；P3对未知helper交给运行期检查 | 不执行P1实验入口 |
-| P1 | `src/p1/helper/pilot_parallel.py` | EvaluationPool、ParallelEvaluator、blocking_lock；评测卡并发及独占计时 | 不调用其中的P1多进程生成调度 |
+| P1 | `src/p1/helper/pilot_parallel.py` | EvaluationPool、ParallelEvaluator、blocking_lock；评测卡共享/独占槽位 | 不调用其中的P1多进程生成调度 |
 | P1 | `src/p1/helper/baseline_state.py` | 北京时间、原子JSON写入、轨迹结束清理input-spec/compile-cache等共享基础函数 | 不调用baseline.py |
 | P1 | `src/p1/helper/build_cache.py` | 可信编译缓存标识、编译互斥和CPU编译槽 | 不复用模型输出答案 |
 | P1 | `src/p1/helper/stream_transport.py` | 参考/候选输出传输、存储空间约束、CPU外部比较所需通道 | 不运行隐藏验收；P3只用feedback阶段 |
@@ -311,3 +313,56 @@ V1的`engine_workers.py`和FSDP `transformer_impl.py`没有读取/执行该字�
 生成服务、P1进度汇总、单次文件解析或轨迹写入流程**。P3轨迹日志由p3/environment.py写入。
 `src/p1/baseline.py`、`status.py`，`scripts/p1-*.sh`、`scripts/p2-train.sh`，
 P1/P2配置和历史runs/checkpoint都不是P3正式运行的前置步骤。
+
+## 10. 2026-11-13：失败边界及吞吐精简
+
+`runs/p3/agent-grpo`在训练前验证中停止。候选`ops6k-acb55914434b1737`的C++代码
+在CPU直接解引用CUDA指针，候选进程退出139；参考五组执行成功。旧分类器将所有
+`WorkerProcessError`当作环境故障，导致整个运行停止。候选源码保留原样，不人工修正。
+
+本次实现：
+
+- 候选执行/测时中的SIGILL/ABRT/FPE/SEGV记为模型失败；参考/控制器异常、OOM、
+  Docker启动失败、SIGKILL/SIGTERM等继续停止，不把环境问题伪装成模型负分。
+- `fail_fast: true`：首个数值/结构/运行失败即通知两端worker停止。只改变失败后的工作量；
+  任何正确候选仍须完整通过五组，不减少比较元素，不改变0.01容差。
+- 快速比较先做同容差的allclose，失败后仅计算首个失败块的误差。通过时`max_abs/max_rel`
+  为null，`diagnostic_scope=not_computed`；失败的误差不是整份输出的全局最大值。
+- 参考预检使用共享槽位。`timing_exclusive: false`使初始eager/compile分析、候选测时及
+  候选后的基线也使用共享槽位；同一候选仍先测候选、后测基线，保持1×10和相同奖励门槛。
+  每卡最多4作业，两个卡合计最多8；满额仍会等待。共享测时可能受其他作业干扰，不用于声称
+  与论文独占测时完全等价，也不能和旧独占结果直接归因比较。
+- `scheduler/reference-profiles/`只缓存同一次运行内相同题目、环境与配置的初始参考分析摘要，
+  多轨迹及后续验证点复用。没有持久缓存大输出/参考张量，不复用候选后的奖励基线；
+  每轨迹输入/参数和参考编译缓存依旧结束清理。初始分析仍包括eager和compile。
+- 工具说明明确evaluate一次即可完成编译、五组验算及测时；不强制模型先单独compile。
+- 总上下文从128K改32K，训练150/验证200轮改为各30轮。原始官方SKILL内容不修改；
+  达到预算后仍按已有规则保留本轨迹已正确测时的最佳源码，无合格候选为-1。
+
+### 吞吐日志与TensorBoard
+
+`actor_rollout_ref.rollout.disable_log_stats: false`直接传给原生vLLM；
+Ray的`runtime_env.env_vars.VLLM_LOGGING_LEVEL: INFO`保证INFO级吞吐日志不被隐藏。
+vLLM周期日志显示prompt/generation token/s、running/waiting请求、KV缓存等；
+这些是引擎实时统计，不会因为开启此开关就自动成为TensorBoard曲线。
+日志出现在启动终端或该run对应Ray目录的worker日志。
+
+```bash
+# 可选：由用户启动新运行并保存终端日志；pipefail保留训练失败的退出状态。
+set -o pipefail
+# 新目录避免把旧128K/独占协议与当前32K/共享协议混在一起。
+bash scripts/p3-train.sh --run runs/p3/agent-grpo-fast 2>&1 | tee /tmp/cuda-agent-p3-fast.log
+```
+
+TensorBoard继续使用verl原生的训练loss、奖励、长度、timing和performance指标；
+其中`perf/throughput`是每GPU的整步token吞吐，包含rollout、工具和更新等阶段，
+不是解码引擎的纯generation token/s。训练步完成后才汇总对应step数据，验证指标也需该轮验证完成后落盘。它不是vLLM周期
+吞吐日志的实时镜像。本次未增加自写监控线程、Prometheus采集或第二套指标落盘。
+
+本次不启动训练、不重放GPU；只做配置/语法检查及已有故障记录的定向回放。
+变更不会修改旧run的`config.yaml`、候选源码或结果。修复后的实际吞吐和共享测时噪声
+需要下一次由用户启动的运行才能确认，不能由静态检查承诺加速倍数。
+
+定向CPU记录回放已通过：旧139崩溃归候选、OOM/容器启动仍致命；首组错误双方各执行
+一组便停，正确夹具仍执行五组；末块错误与NaN/Inf拒绝、初始摘要缓存及配置展开通过。
+未创建CUDA上下文。证据：`.runtime/tmp/p3-fast-feedback-20261113/validation.json`。
