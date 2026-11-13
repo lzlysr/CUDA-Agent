@@ -85,8 +85,12 @@ def finite_reference(value):
     return True
 
 
-def compare(actual, expected, atol=0.01, rtol=0.01):
-    """输入候选/参考输出树及绝对/相对容差；返回 passed、误差摘要及逐层错误。"""
+def compare(actual, expected, atol=0.01, rtol=0.01, *, fast=False, reference_finite=False):
+    """输入输出树、容差和快速反馈开关；返回正确性及错误诊断。
+
+    fast 不抽样：通过时仍检查全部元素；首次失败即结束，误差只描述失败数据块。
+    reference_finite 仅由已独立检查参考有限性的可信调用方设置，避免重复扫描参考。
+    """
     # 积累各输出节点的错误；递归遇到不匹配时记录路径，而不是立即终止整棵树的检查。
     errors = []
     # 整棵输出树中浮点/复数张量的最大绝对误差，初始为 0。
@@ -101,6 +105,8 @@ def compare(actual, expected, atol=0.01, rtol=0.01):
         """输入一对输出节点及路径；递归比较并更新外层错误/误差统计，返回 None。"""
         # 允许递归内部更新 compare 外层的三个统计变量，不另建局部同名变量。
         nonlocal max_abs, max_rel, finite
+        if fast and errors:
+            return
         # 先严格核对 Python 类型；例如 list 和 tuple 即使内容相同也不视为相同输出结构。
         if type(a) != type(b):
             # 记录类型不匹配的节点位置。
@@ -118,10 +124,25 @@ def compare(actual, expected, atol=0.01, rtol=0.01):
                 return
             # 每块最多 8M 元素；只改变外部比较的内存使用，不减少比较元素。
             flat_a, flat_b = a.reshape(-1), b.reshape(-1)
-            chunk = 8 * 1024 * 1024
+            chunk = (1 if fast else 8) * 1024 * 1024
             for begin in range(0, max(1, a.numel()), chunk):
                 aa = flat_a[begin:begin + chunk]
                 bb = flat_b[begin:begin + chunk]
+                if fast:
+                    # allclose 与原检查使用相同容差。参考有限时，NaN/Inf 候选也不会通过。
+                    close = torch.allclose(aa, bb, atol=atol, rtol=rtol, equal_nan=False)
+                    if close and (reference_finite or finite_reference(bb)):
+                        continue
+                    if a.is_floating_point() or a.is_complex():
+                        finite = bool(torch.isfinite(aa).all() and torch.isfinite(bb).all())
+                        delta = (aa - bb).abs()
+                        max_abs = float(delta.max()) if delta.numel() else 0.0
+                        max_rel = float((delta / (bb.abs() + 1e-8)).max()) if delta.numel() else 0.0
+                        # 非有限输出用 finite/errors 表达，JSON 不写 NaN/Infinity 伪数值。
+                        max_abs = max_abs if math.isfinite(max_abs) else None
+                        max_rel = max_rel if math.isfinite(max_rel) else None
+                    errors.append(f"{key}: numerical mismatch at flat offset {begin}")
+                    return
                 if a.is_floating_point() or a.is_complex():
                     finite &= bool(torch.isfinite(aa).all() and torch.isfinite(bb).all())
                     delta = (aa - bb).abs()
@@ -170,13 +191,14 @@ def compare(actual, expected, atol=0.01, rtol=0.01):
         # 必须同时满足没有结构/数值错误，以及所有已检查浮点/复数值有限。
         "passed": not errors and finite,
         # 报告所有张量节点中的最大绝对误差。
-        "max_abs": max_abs,
+        "max_abs": None if fast and not errors else max_abs,
         # 报告所有张量节点中的最大相对误差；它不是独立的通过阈值。
-        "max_rel": max_rel,
+        "max_rel": None if fast and not errors else max_rel,
         # 单独保留有限性标志，便于区分 NaN/Inf 与一般误差超限。
         "finite": finite,
         # 对外只保留前 10 条诊断，避免大型嵌套输出产生过长反馈。
         "errors": errors[:10],
+        "diagnostic_scope": ("first_failed_chunk" if errors else "not_computed") if fast else "full_output",
     }
 
 
@@ -793,6 +815,14 @@ class Evaluator:
         # 按实际配对顺序保存每一个案例的比较结论。
         checks = []
         read_errors = {"reference": [], "candidate": []}
+        stopped = False
+
+        def stop_streams():
+            """通知两端停止后续案例；先写停止标记再确认当前输出，避免多执行下一组。"""
+            nonlocal stopped
+            stopped = True
+            for channel in (expected_channel, actual_channel):
+                (channel / "stop").touch()
 
         def read_item(path, role):
             """输入通道文件及角色；检查普通文件/容量后读取，失败按角色保存证据。"""
@@ -860,7 +890,8 @@ class Evaluator:
                             raise InfrastructureError("stream case order differs")
                         # 调用外部可信比较器，候选代码没有机会自行声称 assert 已通过。
                         check = compare(
-                            c["output"], r["output"], self.cfg["atol"], self.cfg["rtol"]
+                            c["output"], r["output"], self.cfg["atol"], self.cfg["rtol"],
+                            fast=self.cfg.get("fail_fast", False), reference_finite=True,
                         )
                         # 将比较结论与具体案例 ID 一起保存，失败时可以定位到种子和检查类型。
                         checks.append(dict(check, case=r["id"]))
@@ -874,19 +905,25 @@ class Evaluator:
                         checks.append(
                             {"passed": False, "errors": [str(e)], "case": "unreadable-output"}
                         )
-                    # 删除参考输出，确认这一例已被控制器消费，允许参考 worker 继续。
-                    a.unlink()
-                    # 同样确认候选输出；即便本例比较失败，也继续收集后续可用证据。
-                    b.unlink()
+                    if self.cfg.get("fail_fast", False) and not checks[-1]["passed"]:
+                        stop_streams()
+                    # 失败时先通知停止，不再以收集诊断为由执行剩余案例。
+                    a.unlink(missing_ok=True)
+                    # 确认候选输出；默认保留全量诊断，fail_fast 时两端已收到停止通知。
+                    b.unlink(missing_ok=True)
                 # worker 要等待外部确认；若另一端提前失败，仍要释放本端待确认输出。
                 # 清理未配对输出只用于结束握手，不把它当作比较通过。
                 # 任一端的失败状态仍会阻止正确性通过。
                 # 若候选已失败，参考可能仍堵在等待确认，删除它的待确认文件以释放握手。
                 if cf.done() and cf.result().get("status") != "ok":
+                    if self.cfg.get("fail_fast", False) and not stopped:
+                        stop_streams()
                     # 文件可能尚未出现或已删除，因此使用 missing_ok=True；这不新增通过记录。
                     a.unlink(missing_ok=True)
                 # 若参考已失败，也释放候选端待确认输出，避免另一端被动耗尽超时。
                 if rf.done() and rf.result().get("status") != "ok":
+                    if self.cfg.get("fail_fast", False) and not stopped:
+                        stop_streams()
                     b.unlink(missing_ok=True)
                 # 两边容器任务都结束时退出；worker 完成前最后一例也必须先被外部确认。
                 if rf.done() and cf.done():
@@ -895,6 +932,9 @@ class Evaluator:
                 time.sleep(0.01)
             # 取回两端最终状态；result() 会等待尚未完成的任务，并传播线程里的异常。
             rr, cr = rf.result(), cf.result()
+        if stopped:
+            # 标记来自控制器自身，不能信任候选自报 stopped 来取得通过或隔离整题。
+            rr["controller_stopped"] = cr["controller_stopped"] = True
         # 参考文件不可读属于环境无法评分；候选文件不合规属于候选自身失败。
         if read_errors["reference"]:
             rr.update(status="error", failure_kind="reference_output_invalid",
@@ -980,7 +1020,7 @@ class Evaluator:
                        reason="compilation_failed")
             dump(ev / "result.json", result)
             return result
-        # 正确性验算可并发；完成后释放卡，再申请独占性能测量。
+        # 正确性验算可并发；完成后重新取得测时租约，P3 可选择共享以提高吞吐。
         try:
             with self.gpu_operation(exclusive=False):
                 checked = self._check_candidate(task, snap, build, ev, result, final, attempt)
@@ -1016,7 +1056,7 @@ class Evaluator:
         # 两端分别执行，宿主逐例核对输出；ran 是候选 worker 最终返回的状态。
         checks, reference, ran = self.streamed_checks(task, snap, build, ev, phase)
         # 任一端 OOM/异常退出/实际空间不足优先停止，不能被参考补采分支掩盖。
-        if environment_failure(reference) or environment_failure(ran):
+        if environment_failure(reference) or environment_failure(ran, candidate=True):
             result.update(status="infrastructure_error", execution=ran, reference_execution=reference)
             set_reward(result, None, stage="environment", failure_kind="environment",
                        reason="stream_environment_failure", valid=False)
@@ -1036,7 +1076,9 @@ class Evaluator:
             if reference_waited_for_candidate:
                 result["stream_failure"]["diagnosis"] = "candidate_failed_reference_waiting"
         # 先判断参考是否正常；参考出问题时，尚不能据此判断候选算错。
-        if reference["status"] != "ok" and not reference_waited_for_candidate:
+        candidate_rejected = any(not item["passed"] for item in checks) or ran["status"] != "ok"
+        reference_stopped = reference.get("controller_stopped") and reference["status"] == "stopped"
+        if reference["status"] != "ok" and not reference_waited_for_candidate and not (reference_stopped and candidate_rejected):
             # 单独保存参考端故障与候选端状态，保留基础设施证据。
             dump(ev / "infrastructure-error.json", {
                 "reference": reference, "candidate": ran, "checks": checks,
@@ -1048,7 +1090,7 @@ class Evaluator:
             dump(ev / "result.json", result)
             # 由 evaluate 在释放当前租约后完整重试，保持原来的测时/隐藏标记。
             raise _ReferenceStreamFailure("reference stream failed", ev / "infrastructure-error.json")
-        if environment_failure(ran):
+        if environment_failure(ran, candidate=True):
             result.update(status="infrastructure_error", execution=ran, checks=checks)
             set_reward(result, None, stage="environment", failure_kind="environment",
                        reason="candidate_container_environment_failure", valid=False)
@@ -1094,9 +1136,10 @@ class Evaluator:
         return result
 
     def _measure_candidate(self, task, snap, build, ev, result, final, attempt):
-        """输入正确候选；独占同一卡，先测候选再测参考，只用后测基线计算速度和奖励。"""
+        """输入正确候选；同一卡先测候选再测参考，独占/共享由调用方配置。"""
         ref = self.run / "references" / task["task_id"]
         result["baseline_policy"] = "after"
+        result["timing_exclusive"] = self.cfg.get("timing_exclusive", True)
         # 与公开 profiling.py 的先后顺序一致；候选与参考仍分容器，隔离 TF32 等状态。
         measured = self.container(
             "candidate_bench",
@@ -1108,7 +1151,7 @@ class Evaluator:
         result["timing"] = measured
         if measured["status"] != "ok":
             result.update(status="timing_failed", timing_valid=False)
-            if environment_failure(measured):
+            if environment_failure(measured, candidate=True):
                 set_reward(result, None, stage="environment", failure_kind="environment",
                            reason="timing_environment_failure", valid=False)
                 dump(ev / "result.json", result)

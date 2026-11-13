@@ -44,6 +44,16 @@ class StorageLimitError(ValueError):
     """单个输出或本题参数快照超过已声明预算，避免继续写入大文件。"""
 
 
+class StreamStopped(Exception):
+    """控制器已判候选失败；结束输出握手，保留已消费数量与精度状态。"""
+
+    def __init__(self, comparisons, mutations):
+        """输入已消费数量及状态变更记录；不把提前停止解释为正确性通过。"""
+        self.comparisons = comparisons
+        self.mutations = mutations
+        super().__init__("Controller stopped remaining checks after a failure")
+
+
 class RuntimeFallbackError(ValueError):
     """模型实际调用了既定允许表以外的 ATen 计算。"""
 
@@ -756,6 +766,7 @@ def stream(cfg, phase, candidate):
         # 宿主比较器轮询读取的固定文件名。
         channel = Path("/stream") if Path("/stream").is_dir() else Path("/outputs")
         target = channel / "item.pt"
+        stop = channel / "stop"
         # 先写临时文件，避免宿主读到尚未写完的序列化内容。
         tmp = channel / "item.tmp"
         # 输出先转 CPU，再与案例 ID 一起序列化；参考和候选各有独立的输出挂载目录。
@@ -771,6 +782,8 @@ def stream(cfg, phase, candidate):
         # 只有外部比较器删除文件后才算确认，避免候选自行声称比较通过。
         # 文件还存在就继续等待；只有宿主消费后删除它，worker 才发布下一例。
         while target.exists():
+            if stop.exists():
+                raise StreamStopped(count, mutations)
             # 每次等待 10 毫秒，避免空转占用 CPU；容器总超时由控制器负责。
             time.sleep(0.01)
         # 外部确认本例已消费后再累加计数；数值是否通过由外部比较器单独记录。
@@ -780,6 +793,8 @@ def stream(cfg, phase, candidate):
         if flags() != before:
             # 保存发生状态变更的案例标签，交给宿主决定该候选是否合格。
             mutations.append(label)
+        if stop.exists():
+            raise StreamStopped(count, mutations)
 
     # 生成基础案例列表；隐藏阶段的附加检查在循环内及循环后追加。
     cases = case_list(phase, cfg)
@@ -918,6 +933,12 @@ def main():
             elapsed_seconds=CLOCK() - started,
             gpu_uuid=(None if a.mode == "compile" else str(torch.cuda.get_device_properties(0).uuid)),
         )
+    except StreamStopped as e:
+        # 仅是停止无意义的后续案例；控制器已有失败证据，绝不因此算作通过。
+        result = {
+            "status": "stopped", "comparisons": e.comparisons,
+            "state_mutations": e.mutations, "elapsed_seconds": CLOCK() - started,
+        }
     except Exception as e:
         result = {
             "status": "error",

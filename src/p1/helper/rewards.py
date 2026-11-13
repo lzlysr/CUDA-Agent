@@ -54,13 +54,19 @@ def training_reward(evaluation, acceptance=None):
     }
 
 
-def environment_failure(worker_result):
+def environment_failure(worker_result, *, candidate=False):
     """输入容器结果；识别无法归责给候选的启动、依赖和异常退出，返回布尔值。
 
     正常预算内的候选 TimeoutExpired、数值错误和输出容量超限仍是候选失败。
-    信号终止/宿主 OOM 的归属不明时不武断记 -1，保留为环境无法评分。
+    candidate=True 仅用于候选执行/测时：SIGILL、SIGABRT、SIGFPE、SIGSEGV
+    属于候选进程失败；参考、编译器、Docker 启动失败和 OOM 仍按环境故障停止。
     """
     code = worker_result.get("container_returncode")
+    # 候选原生扩展可以直接使进程崩溃，不能因此终止整个训练。
+    # 137/SIGKILL、143/SIGTERM 不在此表中，避免把资源争抢或人工终止当作模型错误。
+    if (candidate and worker_result.get("error_type") == "WorkerProcessError"
+            and code in {132, 134, 136, 139, -4, -6, -8, -11}):
+        return False
     missing = (
         worker_result.get("error_type") == "ModuleNotFoundError"
         and worker_result.get("missing_module") in {"torch", "numpy", "ninja", "packaging", "setuptools"}
