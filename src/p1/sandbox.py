@@ -489,7 +489,8 @@ class SandboxSession:
         if ident in self.foreground_jobs:
             with self.foreground_lock:
                 result = self._poll_foreground(ident)
-                if result["status"] == "completed":
+                # 已结束或硬超时的命令不再按主动取消处理。
+                if result["status"] != "running":
                     return result
                 # 前台 eval 正在父 Bash 内执行；取消它需明确结束会话，不能暗中重建状态。
                 self.bash.close()

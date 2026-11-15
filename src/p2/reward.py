@@ -24,14 +24,16 @@ class P2Evaluator(ParallelEvaluator):
         """输入原容器参数；参考准备/初始基线最多两次，保留失败证据后返回最终结果。
 
         后测基线和参考流已有控制器整次重试，不在这里叠加次数。
-        OOM、异常退出、缺依赖、空间不足立即停止；数值不稳定/非有限立即隔离。
+        OOM、异常退出、缺依赖、实际空间不足仍停止；数值不稳定/非有限立即隔离。
+        候选输出超限保留原错误并返回；参考及其他阶段的容量超限仍是环境故障。
         """
         retryable_stage = mode == "reference_prepare" or (
             mode in {"reference_bench", "reference_profile"} and Path(out).name == "initial-bench"
         )
         for attempt in range(2 if retryable_stage else 1):
             result = super().container(mode, out, **kwargs)
-            if result.get("failure_kind") == "storage_limit":
+            # 候选输出可能因形状错误超限；返回原始错误，让 Agent 修改后再评测。
+            if result.get("failure_kind") == "storage_limit" and mode != "candidate_stream":
                 raise InfrastructureError(f"输出/参数传输容量超限：{result}; details={out}")
             if mode.startswith("reference_") and (
                 environment_failure(result) or result.get("failure_kind") == "missing_dependency"

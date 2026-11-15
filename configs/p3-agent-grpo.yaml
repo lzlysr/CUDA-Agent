@@ -2,15 +2,15 @@
 # 运行：bash scripts/p3-train.sh --run runs/p3/agent-grpo
 
 p3:  # 本地 CUDA 环境、GPU 分工及轨迹预算；其余训练项使用 verl 原生字段
-  training_gpus: [0, 2]  
+  training_gpus: [0, 1]
   context_tokens: 32768  # 单轨迹总上下文32K，包含提示、模型输出和工具观察 # 131072
   training_turns: 30  # 训练最多30轮，限制反复修改候选的成本 # 150
   validation_turns: 30  # 验证使用相同轮数，避免单题长时间试错 # 200
   tools: [Bash, BashOutput, KillBash, Read, Write, Edit, MultiEdit, Glob, Grep, TodoWrite, profile_reference, evaluate, submit]
   kernel:  # 复用 P1/P2 评测器的 CUDA 环境参数
     seed: 42
-    evaluation_gpu: [6, 7]
-    evaluation_concurrency: 4  # 每卡最多4个共享作业；满额仍需排队，不无限增加显存压力
+    evaluation_gpu: [6, 5]
+    evaluation_concurrency: 2  # 每卡最多4个共享作业；满额仍需排队，不无限增加显存压力
     timing_exclusive: false  # 初始性能分析及候选/后测基线共享槽位，优先速度，允许测时噪声
     fail_fast: true  # 首个明确失败就停止剩余验算；通过仍要求五组全部正确
     docker_image: "sha256:d58d23b33e24c351dffc6b1bda93dcd7925e3832e2770da6b65e10abfdd05fa0"
@@ -63,7 +63,7 @@ actor_rollout_ref:  # Actor、rollout 引擎及冻结参考策略的原生配置
       use_cache: false
     use_remove_padding: true  # 在模型前向计算前去掉补齐长度的 PAD token，减少无效计算和激活显存。
     enable_gradient_checkpointing: true  # 反向时重算部分前向激活，省显存但增加计算
-    enable_activation_offload: true  # 使用框架原生激活卸载，降低长上下文显存峰值；容量仍需实测
+    enable_activation_offload: false  # 使用框架原生激活卸载，降低长上下文显存峰值；容量仍需实测
     use_fused_kernels: true  # 使用 verl 原生融合/分块输出头，避免一次保留完整词表 logits
     fused_kernel_options:
       impl_backend: torch
@@ -163,10 +163,10 @@ trainer:
   total_training_steps: 150
   default_local_dir: "${p3.run}/checkpoints"
   resume_mode: disable
-  save_freq: 30
+  save_freq: 1
   test_freq: 5
   val_before_train: true  # 更新前先验证，提供同协议下的训练前参照
-  max_actor_ckpt_to_keep: null
+  max_actor_ckpt_to_keep: 3
   v1:
     trainer_mode: sync
     sampler:

@@ -50,6 +50,14 @@ class WorkspaceTool(BaseTool):
             context.record({'type': 'tool-call', 'name': self.name, 'arguments': parameters})
             try:
                 result = await asyncio.to_thread(context.dispatch, self.name, parameters)
+                if self.name == 'KillBash' and result.get('session_closed') is True:
+                    # 保留取消记录；若后台已有真实环境故障，优先抛出该故障。
+                    context.record({'type': 'tool-response', 'name': self.name, 'result': result})
+                    context.session.check(shell=False)
+                    raise RecoverableSampleError(
+                        '主动取消了前台 Bash 命令，会话已关闭；丢弃当前采样组',
+                        context.directory,
+                    )
             except (InfrastructureError, ReferenceTaskError, RecoverableSampleError,
                     subprocess.SubprocessError) as error:
                 context.fatal = error
@@ -144,7 +152,7 @@ class CudaAgentLoop(ToolAgentLoop):
         return super()._build_assistant_message(content, agent_data)
 
     async def _call_tool(self, tool_call, tools_kwargs, agent_data):
-        """复用原生参数错误反馈；将被原生工具层捕获的致命环境异常重新抛到采样层。"""
+        """保留原生参数错误反馈；将必须结束轨迹的异常继续传给采样层。"""
         result = await super()._call_tool(tool_call, tools_kwargs, agent_data)
         if self.context.fatal is not None:
             raise self.context.fatal
