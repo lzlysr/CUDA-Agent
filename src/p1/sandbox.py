@@ -222,7 +222,9 @@ class SandboxSession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                # 与后台输出一致：替换非 UTF-8 字节，继续读取命令结束标记。
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             self.bash = BashProcess(process)
