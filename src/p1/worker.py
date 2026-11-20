@@ -169,6 +169,34 @@ def tree(x, fn):
     return x
 
 
+def output_layout(value):
+    """输入输出树；只读取张量形状、dtype 及容器结构，返回可写成 JSON 的元数据。"""
+    if isinstance(value, torch.Tensor):
+        return {"shape": list(value.shape), "dtype": str(value.dtype)}
+    if isinstance(value, list):
+        return {"list": [output_layout(item) for item in value]}
+    if isinstance(value, tuple):
+        return {"tuple": [output_layout(item) for item in value]}
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {"dict": {key: output_layout(item) for key, item in value.items()}}
+    # 标量值及含非字符串键的字典仍由宿主比较器处理，避免 JSON 键转换带来的误拒。
+    return None
+
+
+def wait_reference_layout(path, label, stop):
+    """输入参考元数据路径、用例 ID 和停止标记；返回本例元数据，停止时返回 None。"""
+    while not stop.exists():
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            pass
+        else:
+            if record["id"] == label:
+                return record
+        time.sleep(0.01)
+    return None
+
+
 # 把接口返回值统一成可用 * 展开的参数序列；已有列表/元组不再额外嵌套。
 def as_list(x):
     """输入题目接口返回值；将单值包装成列表，列表/元组原样返回。"""
@@ -758,24 +786,50 @@ def stream(cfg, phase, candidate):
                 return call(model, inputs)
         return call(model, inputs)
 
+    channel = Path("/stream") if Path("/stream").is_dir() else Path("/outputs")
+    layout_dir = Path("/reference-layout") if candidate else channel / "layout"
+    layout_path = layout_dir / "item.json" if layout_dir.is_dir() else None
+
     # label 是案例 ID，value 是输出树；发布一例输出并等待宿主确认，无返回值。
     def emit(label, value):
         """输入案例标签和输出值；原子写文件并等待外部确认，累积检查次数，返回 None。"""
         # 嵌套函数需要修改 stream 外层的输出计数器。
         nonlocal count
-        # 宿主比较器轮询读取的固定文件名。
-        channel = Path("/stream") if Path("/stream").is_dir() else Path("/outputs")
         target = channel / "item.pt"
         stop = channel / "stop"
-        # 先写临时文件，避免宿主读到尚未写完的序列化内容。
-        tmp = channel / "item.tmp"
-        # 输出先转 CPU，再与案例 ID 一起序列化；参考和候选各有独立的输出挂载目录。
-        progress("serialize_output", label)
+        record = {"id": label}
+        if layout_path is not None:
+            layout = output_layout(value)
+            if candidate:
+                progress("check_output_layout", label)
+                reference = wait_reference_layout(layout_path, label, stop)
+                if reference is None:
+                    raise StreamStopped(count, mutations)
+                expected = reference["layout"]
+                if layout != expected:
+                    # 回传小诊断，让宿主验证参考后按原流程拒绝；错误大张量无需搬到 CPU。
+                    record["layout_error"] = (
+                        f"output structure or shape/dtype differs; expected {expected!r:.950}, "
+                        f"got {layout!r:.950}"
+                    )
+            else:
+                # 参考端在搬运张量前原子发布元数据；候选只读这一小目录。
+                layout_tmp = layout_path.with_suffix(".tmp")
+                layout_tmp.write_text(json.dumps({"id": label, "layout": layout}), encoding="utf-8")
+                layout_tmp.replace(layout_path)
+
         limit = cfg.get("case_storage_limit_bytes", 8 * 1024**3)
-        # 先在 GPU 输出上估算，避免超大输出先复制到宿主内存；写文件仍有独立硬检查。
-        if storage_bytes(value) > limit:
-            raise StorageLimitError(f"output tensor storage exceeds {limit} bytes")
-        save_limited({"id": label, "output": cpu(value)}, tmp, limit)
+        if "layout_error" not in record:
+            progress("serialize_output", label)
+            # 在复制前检查 GPU 底层存储，写文件时仍独立检查传输上限。
+            if storage_bytes(value) > limit:
+                raise StorageLimitError(f"output tensor storage exceeds {limit} bytes")
+            record["output"] = cpu(value)
+        # 先写临时文件，避免宿主读到尚未写完的结果。
+        tmp = channel / "item.tmp"
+        save_limited(record, tmp, limit)
+        # 释放 CPU 副本，再等待宿主逐例确认。
+        del record
         # 在同一目录原子替换为 item.pt，表示这份输出已写完、可以读取。
         tmp.replace(target)
         progress("waiting_for_ack", label)

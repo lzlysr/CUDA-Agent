@@ -283,6 +283,7 @@ class Evaluator:
         script=None,
         script_args=None,
         stream=None,
+        reference_layout=None,
     ):
         """输入模式、输出目录、只读挂载和超时；在指定编号 GPU 隔离执行，返回状态/日志/耗时。"""
         # 统一输出路径类型，并建立可写的宿主结果目录。
@@ -360,6 +361,8 @@ class Evaluator:
             (experiment, "/experiment"),
             # 每个容器只得到自己的临时输出通道，不暴露另一端或整个 /dev/shm。
             (stream, "/stream"),
+            # 候选只读参考的形状与 dtype；完整参考输出仍在另一个目录。
+            (reference_layout, "/reference-layout"),
         ]:
             # None 表示本次模式不需要该目录，因此完全不挂载。
             if p is not None:
@@ -812,6 +815,9 @@ class Evaluator:
         # 为两端各创建全新输出目录，避免读取上一轮残留的 item.pt。
         expected.mkdir()
         actual.mkdir()
+        # 这个子目录由参考容器发布元数据，候选仅单独只读挂载该子目录。
+        reference_layout = expected_channel / "layout"
+        reference_layout.mkdir()
         # 按实际配对顺序保存每一个案例的比较结论。
         checks = []
         read_errors = {"reference": [], "candidate": []}
@@ -865,6 +871,7 @@ class Evaluator:
                 "candidate_stream",
                 actual,
                 stream=actual_channel,
+                reference_layout=reference_layout,
                 candidate=snap,
                 inputs=ref / "cases/input-spec",
                 build=build,
@@ -888,11 +895,21 @@ class Evaluator:
                         # 案例标签必须相同；顺序错乱属于评测协议错误，不能比较两份不同输入的输出。
                         if r["id"] != c["id"]:
                             raise InfrastructureError("stream case order differs")
-                        # 调用外部可信比较器，候选代码没有机会自行声称 assert 已通过。
-                        check = compare(
-                            c["output"], r["output"], self.cfg["atol"], self.cfg["rtol"],
-                            fast=self.cfg.get("fail_fast", False), reference_finite=True,
-                        )
+                        # 只有参考输出通过独立读取与有限性检查后，才把形状错误记给候选。
+                        if "layout_error" in c:
+                            message = c["layout_error"]
+                            if not isinstance(message, str) or not message:
+                                raise ValueError("invalid output layout diagnostic")
+                            check = {
+                                "passed": False, "errors": [message[:2000]],
+                                "diagnostic_scope": "output_layout",
+                            }
+                        else:
+                            # 形状预检只能拒绝，正常输出仍使用外部数值比较器。
+                            check = compare(
+                                c["output"], r["output"], self.cfg["atol"], self.cfg["rtol"],
+                                fast=self.cfg.get("fail_fast", False), reference_finite=True,
+                            )
                         # 将比较结论与具体案例 ID 一起保存，失败时可以定位到种子和检查类型。
                         checks.append(dict(check, case=r["id"]))
                         # 及时释放两棵输出树的引用，避免多案例累积占用宿主内存。
@@ -922,7 +939,8 @@ class Evaluator:
                     a.unlink(missing_ok=True)
                 # 若参考已失败，也释放候选端待确认输出，避免另一端被动耗尽超时。
                 if rf.done() and rf.result().get("status") != "ok":
-                    if self.cfg.get("fail_fast", False) and not stopped:
+                    # 参考已无法发布后续形状，即使关闭 fail_fast 也要唤醒候选。
+                    if not stopped:
                         stop_streams()
                     b.unlink(missing_ok=True)
                 # 两边容器任务都结束时退出；worker 完成前最后一例也必须先被外部确认。
